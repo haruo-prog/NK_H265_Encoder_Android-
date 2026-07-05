@@ -8,7 +8,9 @@ import android.app.Service;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
-import android.database.Cursor;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -16,7 +18,6 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.MediaStore;
-import android.provider.OpenableColumns;
 import android.text.TextUtils;
 
 import androidx.annotation.Nullable;
@@ -51,6 +52,7 @@ public class EncodeForegroundService extends Service {
     public static final String EXTRA_URI = "extra_uri";
     public static final String EXTRA_NAME = "extra_name";
     public static final String EXTRA_PRESET = "extra_preset";
+    public static final String EXTRA_MODE = "extra_mode";
     public static final String EXTRA_MESSAGE = "message";
     public static final String EXTRA_PROGRESS = "progress";
     public static final String EXTRA_DONE = "done";
@@ -71,14 +73,12 @@ public class EncodeForegroundService extends Service {
         HIGH("高解像度 1080p目安", 1920, 1080, 24, "veryfast", "160k"),
         MEDIUM("中解像度 720p目安", 1280, 720, 27, "veryfast", "128k"),
         LOW("低解像度 480p目安", 854, 480, 31, "ultrafast", "96k");
-
         final String label;
         final int width;
         final int height;
         final int crf;
         final String speedPreset;
         final String audioBitrate;
-
         Preset(String label, int width, int height, int crf, String speedPreset, String audioBitrate) {
             this.label = label;
             this.width = width;
@@ -89,102 +89,90 @@ public class EncodeForegroundService extends Service {
         }
     }
 
-    @Nullable
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
+    public enum EncodeMode {
+        FAST("高速モード"), STANDARD("標準モード"), QUALITY("画質優先モード");
+        final String label;
+        EncodeMode(String label) { this.label = label; }
     }
 
-    @Override
-    public void onCreate() {
+    @Nullable @Override public IBinder onBind(Intent intent) { return null; }
+
+    @Override public void onCreate() {
         super.onCreate();
         createNotificationChannel();
     }
 
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || !ACTION_START.equals(intent.getAction())) {
-            return START_NOT_STICKY;
-        }
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent == null || !ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
         if (running) {
             broadcast("すでにエンコード中です。", 0, false, false);
             return START_STICKY;
         }
-
         Uri uri = intent.getParcelableExtra(EXTRA_URI);
         String name = intent.getStringExtra(EXTRA_NAME);
-        String presetName = intent.getStringExtra(EXTRA_PRESET);
-        Preset preset = parsePreset(presetName);
-
+        Preset preset = parsePreset(intent.getStringExtra(EXTRA_PRESET));
+        EncodeMode mode = parseMode(intent.getStringExtra(EXTRA_MODE));
         running = true;
         startForeground(NOTIFICATION_ID, buildNotification("エンコード準備中", 0, false));
         broadcast("バックグラウンドエンコードを開始しました。", 0, false, false);
-
-        new Thread(() -> runEncode(uri, name, preset), "nk-encoder-service-worker").start();
+        new Thread(() -> runEncode(uri, name, preset, mode), "nk-encoder-service-worker").start();
         return START_STICKY;
     }
 
-    @Override
-    public void onDestroy() {
+    @Override public void onDestroy() {
         stopProgressPolling();
-        try {
-            if (transformer != null) transformer.cancel();
-        } catch (Throwable ignored) {
-        }
+        try { if (transformer != null) transformer.cancel(); } catch (Throwable ignored) {}
         deleteQuietly(activeInputFile);
         super.onDestroy();
     }
 
-    private void runEncode(Uri uri, String displayName, Preset preset) {
+    private void runEncode(Uri uri, String displayName, Preset preset, EncodeMode mode) {
         try {
             if (uri == null) throw new IOException("入力URIがありません。");
             activeInputFile = copyUriToCache(uri, displayName);
-            if (!activeInputFile.exists() || activeInputFile.length() == 0) {
-                throw new IOException("入力ファイルのコピーに失敗しました。");
-            }
-            activeOutputFile = createOutputFile(preset);
-
+            if (!activeInputFile.exists() || activeInputFile.length() == 0) throw new IOException("入力ファイルのコピーに失敗しました。");
+            activeOutputFile = createOutputFile(preset, mode);
             broadcast("入力サイズ: " + formatBytes(activeInputFile.length()), 3, false, false);
+            broadcast("モード: " + mode.label, 4, false, false);
+            broadcast("CPUコア数: " + Runtime.getRuntime().availableProcessors(), 4, false, false);
             updateNotification("入力ファイル準備完了", 3, false);
-
             if (isMp4Like(activeInputFile.getName())) {
-                broadcast("Media3開始 / バックグラウンドで続行します。", 5, false, false);
-                mainHandler.post(() -> runMedia3Encode(activeInputFile, activeOutputFile, preset));
+                String encoder = findHevcEncoderName();
+                broadcast("HEVCエンコーダ候補: " + encoder, 5, false, false);
+                broadcast("Media3 / MediaCodec で高速変換します。", 5, false, false);
+                mainHandler.post(() -> runMedia3Encode(activeInputFile, activeOutputFile, preset, mode, encoder));
             } else {
                 broadcast("AVI/非MP4のためFFmpeg互換ルートを使用します。", 5, false, false);
-                runFfmpegEncode(activeInputFile, activeOutputFile, preset);
+                runFfmpegEncode(activeInputFile, activeOutputFile, preset, mode);
             }
         } catch (Throwable e) {
             finishWithError("エラー: " + safeMessage(e), e);
         }
     }
 
-    private void runMedia3Encode(File inputFile, File outputFile, Preset preset) {
+    private void runMedia3Encode(File inputFile, File outputFile, Preset preset, EncodeMode mode, String encoderName) {
         try {
+            int targetHeight = effectiveHeight(preset, mode);
+            broadcast("実行解像度: 高さ " + targetHeight + "px", 6, false, false);
+            if (encoderName.toLowerCase(Locale.US).contains("software") || encoderName.toLowerCase(Locale.US).contains("android")) {
+                broadcast("注意: ソフトウェア系エンコーダの可能性があります。", 6, false, false);
+            }
             MediaItem mediaItem = MediaItem.fromUri(Uri.fromFile(inputFile));
             EditedMediaItem editedMediaItem = new EditedMediaItem.Builder(mediaItem)
-                    .setEffects(new Effects(
-                            Collections.emptyList(),
-                            Collections.singletonList(Presentation.createForHeight(preset.height))))
+                    .setEffects(new Effects(Collections.emptyList(), Collections.singletonList(Presentation.createForHeight(targetHeight))))
                     .build();
-
             transformer = new Transformer.Builder(this)
                     .setVideoMimeType(MimeTypes.VIDEO_H265)
                     .setAudioMimeType(MimeTypes.AUDIO_AAC)
                     .build();
-
             transformer.addListener(new Transformer.Listener() {
-                @Override
-                public void onCompleted(Composition composition, ExportResult exportResult) {
-                    finishWithSuccess(inputFile, outputFile, "Media3変換成功");
+                @Override public void onCompleted(Composition composition, ExportResult exportResult) {
+                    finishWithSuccess(inputFile, outputFile, "Media3変換成功 / " + mode.label);
                 }
-
-                @Override
-                public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
+                @Override public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
                     finishWithError("Media3変換に失敗しました: " + safeMessage(exportException), exportException);
                 }
             });
-
             transformer.start(editedMediaItem, outputFile.getAbsolutePath());
             startProgressPolling();
         } catch (Throwable e) {
@@ -192,11 +180,52 @@ public class EncodeForegroundService extends Service {
         }
     }
 
+    private int effectiveHeight(Preset preset, EncodeMode mode) {
+        if (mode == EncodeMode.FAST) {
+            if (preset == Preset.HIGH) return 720;
+            if (preset == Preset.MEDIUM) return 540;
+            return 480;
+        }
+        return preset.height;
+    }
+
+    private String findHevcEncoderName() {
+        try {
+            MediaCodecInfo[] infos = new MediaCodecList(MediaCodecList.ALL_CODECS).getCodecInfos();
+            String fallback = "未検出";
+            for (MediaCodecInfo info : infos) {
+                if (!info.isEncoder()) continue;
+                boolean supportsHevc = false;
+                for (String type : info.getSupportedTypes()) {
+                    if (MediaFormat.MIMETYPE_VIDEO_HEVC.equalsIgnoreCase(type)) {
+                        supportsHevc = true;
+                        break;
+                    }
+                }
+                if (!supportsHevc) continue;
+                String name = info.getName();
+                boolean hardware = isLikelyHardware(info, name);
+                if (hardware) return name + " / hardware";
+                fallback = name + " / software候補";
+            }
+            return fallback;
+        } catch (Throwable e) {
+            return "検出失敗: " + safeMessage(e);
+        }
+    }
+
+    private boolean isLikelyHardware(MediaCodecInfo info, String name) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            try { return info.isHardwareAccelerated(); } catch (Throwable ignored) {}
+        }
+        String lower = name.toLowerCase(Locale.US);
+        return !(lower.startsWith("omx.google") || lower.startsWith("c2.android") || lower.contains("software"));
+    }
+
     private void startProgressPolling() {
         stopProgressPolling();
         progressRunnable = new Runnable() {
-            @Override
-            public void run() {
+            @Override public void run() {
                 if (!running || transformer == null) return;
                 try {
                     ProgressHolder holder = new ProgressHolder();
@@ -226,17 +255,15 @@ public class EncodeForegroundService extends Service {
         }
     }
 
-    private void runFfmpegEncode(File inputFile, File outputFile, Preset preset) {
-        String[] args = buildFfmpegArguments(inputFile, outputFile, preset);
+    private void runFfmpegEncode(File inputFile, File outputFile, Preset preset, EncodeMode mode) {
+        String[] args = buildFfmpegArguments(inputFile, outputFile, preset, mode);
         try {
             FFmpegKit.executeWithArgumentsAsync(args, session -> {
                 if (ReturnCode.isSuccess(session.getReturnCode()) && outputFile.exists() && outputFile.length() > 0) {
-                    finishWithSuccess(inputFile, outputFile, "FFmpeg互換ルート変換成功");
+                    finishWithSuccess(inputFile, outputFile, "FFmpeg互換ルート変換成功 / " + mode.label);
                 } else {
                     String message = "FFmpeg互換ルートの変換に失敗しました。";
-                    if (!TextUtils.isEmpty(session.getFailStackTrace())) {
-                        message += " " + session.getFailStackTrace();
-                    }
+                    if (!TextUtils.isEmpty(session.getFailStackTrace())) message += " " + session.getFailStackTrace();
                     finishWithError(message, null);
                 }
             });
@@ -247,11 +274,10 @@ public class EncodeForegroundService extends Service {
 
     private void finishWithSuccess(File inputFile, File outputFile, String label) {
         stopProgressPolling();
-        Uri savedUri = saveToMediaStore(outputFile);
+        saveToMediaStore(outputFile);
         deleteQuietly(inputFile);
         running = false;
-        String message = label + " / 保存完了: Movies / NK Encoder";
-        broadcast(message, 100, true, true);
+        broadcast(label + " / 保存完了: Movies / NK Encoder", 100, true, true);
         updateNotification("エンコード完了", 100, true);
         stopForeground(false);
         stopSelf();
@@ -271,29 +297,16 @@ public class EncodeForegroundService extends Service {
 
     private Notification buildNotification(String text, int progress, boolean done) {
         Intent openIntent = new Intent(this, MainActivity.class);
-        PendingIntent pendingIntent = PendingIntent.getActivity(
-                this,
-                0,
-                openIntent,
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0
-        );
-
-        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                ? new Notification.Builder(this, CHANNEL_ID)
-                : new Notification.Builder(this);
-
+        PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, openIntent, Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
         builder.setContentTitle("NK H.265 Encoder")
                 .setContentText(text)
                 .setSmallIcon(android.R.drawable.stat_sys_upload)
                 .setContentIntent(pendingIntent)
                 .setOngoing(!done)
                 .setOnlyAlertOnce(true);
-
-        if (done) {
-            builder.setProgress(0, 0, false);
-        } else {
-            builder.setProgress(100, Math.max(0, Math.min(100, progress)), false);
-        }
+        if (done) builder.setProgress(0, 0, false);
+        else builder.setProgress(100, Math.max(0, Math.min(100, progress)), false);
         return builder.build();
     }
 
@@ -304,11 +317,7 @@ public class EncodeForegroundService extends Service {
 
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID,
-                    "NK H.265 Encoder",
-                    NotificationManager.IMPORTANCE_LOW
-            );
+            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "NK H.265 Encoder", NotificationManager.IMPORTANCE_LOW);
             channel.setDescription("エンコード進行状況");
             NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
             if (manager != null) manager.createNotificationChannel(channel);
@@ -326,25 +335,31 @@ public class EncodeForegroundService extends Service {
     }
 
     private Preset parsePreset(String name) {
-        try {
-            return Preset.valueOf(name);
-        } catch (Exception ignored) {
-            return Preset.LOW;
-        }
+        try { return Preset.valueOf(name); } catch (Exception ignored) { return Preset.LOW; }
     }
 
-    private String[] buildFfmpegArguments(File inputFile, File outputFile, Preset preset) {
-        String scaleFilter = "scale=w='min(" + preset.width + ",iw)':h='min(" + preset.height + ",ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p";
+    private EncodeMode parseMode(String name) {
+        try { return EncodeMode.valueOf(name); } catch (Exception ignored) { return EncodeMode.FAST; }
+    }
+
+    private String[] buildFfmpegArguments(File inputFile, File outputFile, Preset preset, EncodeMode mode) {
+        String scaleFilter = "scale=w='min(" + preset.width + ",iw)':h='min(" + effectiveHeight(preset, mode) + ",ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p";
+        int cores = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+        int threads = mode == EncodeMode.QUALITY ? Math.min(4, cores) : Math.min(8, cores);
+        int crf = preset.crf;
+        String speedPreset = preset.speedPreset;
+        if (mode == EncodeMode.FAST) { crf += 2; speedPreset = "ultrafast"; }
+        if (mode == EncodeMode.QUALITY) { crf -= 2; speedPreset = "slow"; }
         return new String[]{
                 "-y", "-nostdin", "-hide_banner",
                 "-i", inputFile.getAbsolutePath(),
                 "-map", "0:v:0", "-map", "0:a?", "-dn", "-sn",
                 "-vf", scaleFilter,
                 "-c:v", "libx265", "-tag:v", "hvc1",
-                "-preset", preset.speedPreset,
-                "-crf", String.valueOf(preset.crf),
-                "-threads", "1",
-                "-x265-params", "log-level=error:pools=1:frame-threads=1:wpp=0",
+                "-preset", speedPreset,
+                "-crf", String.valueOf(crf),
+                "-threads", String.valueOf(threads),
+                "-x265-params", "log-level=error:pools=" + threads + ":frame-threads=1",
                 "-c:a", "aac", "-b:a", preset.audioBitrate, "-ac", "2",
                 "-map_metadata", "-1", "-max_muxing_queue_size", "9999",
                 "-movflags", "+faststart",
@@ -355,8 +370,7 @@ public class EncodeForegroundService extends Service {
     private File copyUriToCache(Uri uri, String displayName) throws IOException {
         String extension = getSafeExtension(displayName);
         File inputFile = new File(getCacheDir(), "nk_encoder_input_" + System.currentTimeMillis() + extension);
-        try (InputStream in = getContentResolver().openInputStream(uri);
-             OutputStream out = new FileOutputStream(inputFile)) {
+        try (InputStream in = getContentResolver().openInputStream(uri); OutputStream out = new FileOutputStream(inputFile)) {
             if (in == null) throw new IOException("入力ファイルを開けませんでした。");
             byte[] buffer = new byte[COPY_BUFFER_SIZE];
             int read;
@@ -365,15 +379,13 @@ public class EncodeForegroundService extends Service {
         return inputFile;
     }
 
-    private File createOutputFile(Preset preset) throws IOException {
+    private File createOutputFile(Preset preset, EncodeMode mode) throws IOException {
         File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
         if (dir == null) dir = getFilesDir();
         File encoderDir = new File(dir, "NK_Encoder");
-        if (!encoderDir.exists() && !encoderDir.mkdirs()) {
-            throw new IOException("出力フォルダを作成できませんでした。");
-        }
+        if (!encoderDir.exists() && !encoderDir.mkdirs()) throw new IOException("出力フォルダを作成できませんでした。");
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        return new File(encoderDir, "encoded_" + preset.name().toLowerCase(Locale.US) + "_" + timestamp + ".mp4");
+        return new File(encoderDir, "encoded_" + preset.name().toLowerCase(Locale.US) + "_" + mode.name().toLowerCase(Locale.US) + "_" + timestamp + ".mp4");
     }
 
     private Uri saveToMediaStore(File file) {
@@ -384,12 +396,9 @@ public class EncodeForegroundService extends Service {
         values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
         values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/NK Encoder");
         values.put(MediaStore.Video.Media.IS_PENDING, 1);
-
         Uri uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
         if (uri == null) return null;
-
-        try (InputStream in = new FileInputStream(file);
-             OutputStream out = resolver.openOutputStream(uri)) {
+        try (InputStream in = new FileInputStream(file); OutputStream out = resolver.openOutputStream(uri)) {
             if (out == null) return null;
             byte[] buffer = new byte[COPY_BUFFER_SIZE];
             int read;
