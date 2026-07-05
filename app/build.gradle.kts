@@ -10,8 +10,8 @@ android {
         applicationId = "jp.co.nkts.encoder"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.1.1"
 
         // Include native FFmpeg libraries for major Android device ABIs.
         ndk {
@@ -26,8 +26,9 @@ android {
 
     packaging {
         jniLibs {
-            // Keep modern native library packaging for current Android devices.
-            useLegacyPackaging = false
+            // FFmpegKit loads native libraries from the app nativeLibraryDir.
+            // On Android 16/API 36 devices this must be extracted, otherwise FFmpegKit can fail to start.
+            useLegacyPackaging = true
         }
     }
 }
