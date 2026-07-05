@@ -1,10 +1,12 @@
 package jp.co.nkts.encoder;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Typeface;
 import android.net.Uri;
@@ -25,6 +27,7 @@ import android.widget.Toast;
 
 public class MainActivity extends Activity {
     private static final int REQUEST_PICK_VIDEO = 1001;
+    private static final int REQUEST_NOTIFY = 2001;
 
     private Uri selectedVideoUri;
     private String selectedVideoName = "";
@@ -32,6 +35,7 @@ public class MainActivity extends Activity {
 
     private TextView fileText;
     private Spinner presetSpinner;
+    private Spinner modeSpinner;
     private ProgressBar progressBar;
     private TextView progressText;
     private TextView statusText;
@@ -43,21 +47,27 @@ public class MainActivity extends Activity {
         HIGH("高解像度 1080p目安"),
         MEDIUM("中解像度 720p目安"),
         LOW("低解像度 480p目安");
-
         final String label;
         ResolutionPreset(String label) { this.label = label; }
         @Override public String toString() { return label; }
     }
 
+    private enum EncodeMode {
+        FAST("高速モード / 内蔵エンコーダ優先"),
+        STANDARD("標準モード"),
+        QUALITY("画質優先モード");
+        final String label;
+        EncodeMode(String label) { this.label = label; }
+        @Override public String toString() { return label; }
+    }
+
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
-        @Override
-        public void onReceive(Context context, Intent intent) {
+        @Override public void onReceive(Context context, Intent intent) {
             if (!EncodeForegroundService.ACTION_STATUS.equals(intent.getAction())) return;
             String message = intent.getStringExtra(EncodeForegroundService.EXTRA_MESSAGE);
             int progress = intent.getIntExtra(EncodeForegroundService.EXTRA_PROGRESS, 0);
             boolean done = intent.getBooleanExtra(EncodeForegroundService.EXTRA_DONE, false);
             boolean success = intent.getBooleanExtra(EncodeForegroundService.EXTRA_SUCCESS, false);
-
             updateProgress(progress);
             if (!TextUtils.isEmpty(message)) {
                 statusText.setText(message);
@@ -70,25 +80,20 @@ public class MainActivity extends Activity {
         }
     };
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
+    @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(createContentView());
+        requestNotifyPermissionIfNeeded();
     }
 
-    @Override
-    protected void onStart() {
+    @Override protected void onStart() {
         super.onStart();
         IntentFilter filter = new IntentFilter(EncodeForegroundService.ACTION_STATUS);
-        if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
-        } else {
-            registerReceiver(statusReceiver, filter);
-        }
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(statusReceiver, filter);
     }
 
-    @Override
-    protected void onStop() {
+    @Override protected void onStop() {
         try { unregisterReceiver(statusReceiver); } catch (Exception ignored) {}
         super.onStop();
     }
@@ -98,7 +103,6 @@ public class MainActivity extends Activity {
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
         scrollView.setBackgroundColor(0xFFF8FAFC);
-
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(padding, padding, padding, padding);
@@ -111,7 +115,7 @@ public class MainActivity extends Activity {
         title.setTextColor(0xFF111827);
         root.addView(title);
 
-        TextView subtitle = makeInfoText("MP4はAndroid公式Media3でH.265変換します。\nバックグラウンド変換・進行バー対応 v1.3.0");
+        TextView subtitle = makeInfoText("MP4はAndroid公式Media3でH.265変換します。\nハードウェア高速エンコード対応 v1.4.0");
         subtitle.setTextSize(15);
         subtitle.setPadding(0, dp(6), 0, dp(18));
         root.addView(subtitle);
@@ -126,13 +130,22 @@ public class MainActivity extends Activity {
 
         TextView presetLabel = makeSectionLabel("解像度");
         root.addView(presetLabel);
-
         presetSpinner = new Spinner(this);
-        ArrayAdapter<ResolutionPreset> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, ResolutionPreset.values());
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        presetSpinner.setAdapter(adapter);
+        ArrayAdapter<ResolutionPreset> presetAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, ResolutionPreset.values());
+        presetAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        presetSpinner.setAdapter(presetAdapter);
         presetSpinner.setSelection(ResolutionPreset.LOW.ordinal());
         root.addView(presetSpinner);
+
+        TextView modeLabel = makeSectionLabel("エンコードモード");
+        modeLabel.setPadding(0, dp(18), 0, 0);
+        root.addView(modeLabel);
+        modeSpinner = new Spinner(this);
+        ArrayAdapter<EncodeMode> modeAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, EncodeMode.values());
+        modeAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        modeSpinner.setAdapter(modeAdapter);
+        modeSpinner.setSelection(EncodeMode.FAST.ordinal());
+        root.addView(modeSpinner);
 
         encodeButton = makeButton("H.265 MP4に変換開始");
         LinearLayout.LayoutParams encodeParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -144,12 +157,10 @@ public class MainActivity extends Activity {
         TextView progressLabel = makeSectionLabel("エンコード進行状況");
         progressLabel.setPadding(0, dp(22), 0, dp(8));
         root.addView(progressLabel);
-
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         progressBar.setProgress(0);
         root.addView(progressBar, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(18)));
-
         progressText = makeInfoText("0%");
         progressText.setGravity(Gravity.CENTER_HORIZONTAL);
         progressText.setPadding(0, dp(8), 0, dp(6));
@@ -162,7 +173,6 @@ public class MainActivity extends Activity {
         TextView logLabel = makeSectionLabel("処理ログ");
         logLabel.setPadding(0, dp(24), 0, dp(8));
         root.addView(logLabel);
-
         logText = makeInfoText("ここに変換状況が表示されます。");
         logText.setTextSize(13);
         logText.setBackgroundColor(0xFFE2E8F0);
@@ -174,7 +184,6 @@ public class MainActivity extends Activity {
         credit.setTextColor(0xFF64748B);
         credit.setPadding(0, dp(26), 0, dp(10));
         root.addView(credit);
-
         return scrollView;
     }
 
@@ -218,8 +227,7 @@ public class MainActivity extends Activity {
         startActivityForResult(intent, REQUEST_PICK_VIDEO);
     }
 
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQUEST_PICK_VIDEO && resultCode == RESULT_OK && data != null) {
             selectedVideoUri = data.getData();
@@ -242,23 +250,31 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "現在変換中です。", Toast.LENGTH_SHORT).show();
             return;
         }
-
+        requestNotifyPermissionIfNeeded();
         ResolutionPreset preset = (ResolutionPreset) presetSpinner.getSelectedItem();
+        EncodeMode mode = (EncodeMode) modeSpinner.getSelectedItem();
         if (preset == null) preset = ResolutionPreset.LOW;
+        if (mode == null) mode = EncodeMode.FAST;
 
         updateProgress(0);
         setBusy(true, "バックグラウンドエンコードを開始します...");
         appendLog("変換プリセット: " + preset.label);
-        appendLog("バックグラウンドサービスを起動します。");
+        appendLog("エンコードモード: " + mode.label);
 
         Intent serviceIntent = new Intent(this, EncodeForegroundService.class);
         serviceIntent.setAction(EncodeForegroundService.ACTION_START);
         serviceIntent.putExtra(EncodeForegroundService.EXTRA_URI, selectedVideoUri);
         serviceIntent.putExtra(EncodeForegroundService.EXTRA_NAME, selectedVideoName);
         serviceIntent.putExtra(EncodeForegroundService.EXTRA_PRESET, preset.name());
-
+        serviceIntent.putExtra(EncodeForegroundService.EXTRA_MODE, mode.name());
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent);
         else startService(serviceIntent);
+    }
+
+    private void requestNotifyPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFY);
+        }
     }
 
     private void updateProgress(int progress) {
@@ -286,6 +302,7 @@ public class MainActivity extends Activity {
         pickButton.setEnabled(!busy);
         encodeButton.setEnabled(!busy);
         presetSpinner.setEnabled(!busy);
+        modeSpinner.setEnabled(!busy);
         statusText.setText(status);
     }
 
