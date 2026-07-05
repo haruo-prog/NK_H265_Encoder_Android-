@@ -270,18 +270,19 @@ public class MainActivity extends Activity {
                 throw new IOException("入力ファイルのコピーに失敗しました。");
             }
 
-            File outputFile = createOutputFile(preset);
-            String[] args = buildFfmpegArguments(inputFile, outputFile, preset);
+            final File preparedInputFile = inputFile;
+            final File outputFile = createOutputFile(preset);
+            String[] args = buildFfmpegArguments(preparedInputFile, outputFile, preset);
 
             runOnUiThread(() -> {
                 statusText.setText("変換中... 画面を閉じずにお待ちください。");
                 appendLog("FFmpeg開始");
-                appendLog("入力サイズ: " + formatBytes(inputFile.length()));
+                appendLog("入力サイズ: " + formatBytes(preparedInputFile.length()));
                 appendLog("出力予定: " + outputFile.getName());
                 appendLog("x265安定化: threads=1 / frame-threads=1");
             });
 
-            File finalInputFile = inputFile;
+            final File finalInputFile = preparedInputFile;
             try {
                 FFmpegKit.executeWithArgumentsAsync(args, session -> {
                     try {
