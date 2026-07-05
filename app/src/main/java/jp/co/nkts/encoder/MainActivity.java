@@ -1,16 +1,15 @@
 package jp.co.nkts.encoder;
 
 import android.app.Activity;
-import android.content.ContentResolver;
-import android.content.ContentValues;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.database.Cursor;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.Environment;
-import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.text.TextUtils;
 import android.view.Gravity;
@@ -24,73 +23,52 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.media3.common.MediaItem;
-import androidx.media3.common.MimeTypes;
-import androidx.media3.effect.Presentation;
-import androidx.media3.transformer.Composition;
-import androidx.media3.transformer.EditedMediaItem;
-import androidx.media3.transformer.Effects;
-import androidx.media3.transformer.ExportException;
-import androidx.media3.transformer.ExportResult;
-import androidx.media3.transformer.Transformer;
-
-import com.arthenica.ffmpegkit.FFmpegKit;
-import com.arthenica.ffmpegkit.ReturnCode;
-
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.text.SimpleDateFormat;
-import java.util.Collections;
-import java.util.Date;
-import java.util.Locale;
-
 public class MainActivity extends Activity {
     private static final int REQUEST_PICK_VIDEO = 1001;
-    private static final int COPY_BUFFER_SIZE = 256 * 1024;
 
     private Uri selectedVideoUri;
     private String selectedVideoName = "";
-    private volatile boolean encodingInProgress = false;
-    private Transformer media3Transformer;
+    private boolean encodingInProgress = false;
 
     private TextView fileText;
     private Spinner presetSpinner;
     private ProgressBar progressBar;
+    private TextView progressText;
     private TextView statusText;
     private TextView logText;
     private Button pickButton;
     private Button encodeButton;
 
     private enum ResolutionPreset {
-        HIGH("高解像度 1080p目安", 1920, 1080, 24, "veryfast", "160k"),
-        MEDIUM("中解像度 720p目安", 1280, 720, 27, "veryfast", "128k"),
-        LOW("低解像度 480p目安", 854, 480, 31, "ultrafast", "96k");
+        HIGH("高解像度 1080p目安"),
+        MEDIUM("中解像度 720p目安"),
+        LOW("低解像度 480p目安");
 
         final String label;
-        final int width;
-        final int height;
-        final int crf;
-        final String speedPreset;
-        final String audioBitrate;
-
-        ResolutionPreset(String label, int width, int height, int crf, String speedPreset, String audioBitrate) {
-            this.label = label;
-            this.width = width;
-            this.height = height;
-            this.crf = crf;
-            this.speedPreset = speedPreset;
-            this.audioBitrate = audioBitrate;
-        }
-
-        @Override
-        public String toString() {
-            return label;
-        }
+        ResolutionPreset(String label) { this.label = label; }
+        @Override public String toString() { return label; }
     }
+
+    private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (!EncodeForegroundService.ACTION_STATUS.equals(intent.getAction())) return;
+            String message = intent.getStringExtra(EncodeForegroundService.EXTRA_MESSAGE);
+            int progress = intent.getIntExtra(EncodeForegroundService.EXTRA_PROGRESS, 0);
+            boolean done = intent.getBooleanExtra(EncodeForegroundService.EXTRA_DONE, false);
+            boolean success = intent.getBooleanExtra(EncodeForegroundService.EXTRA_SUCCESS, false);
+
+            updateProgress(progress);
+            if (!TextUtils.isEmpty(message)) {
+                statusText.setText(message);
+                appendLog(message);
+            }
+            if (done) {
+                setBusy(false, success ? "完了" : "失敗");
+                updateProgress(success ? 100 : progress);
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -98,9 +76,25 @@ public class MainActivity extends Activity {
         setContentView(createContentView());
     }
 
+    @Override
+    protected void onStart() {
+        super.onStart();
+        IntentFilter filter = new IntentFilter(EncodeForegroundService.ACTION_STATUS);
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(statusReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(statusReceiver, filter);
+        }
+    }
+
+    @Override
+    protected void onStop() {
+        try { unregisterReceiver(statusReceiver); } catch (Exception ignored) {}
+        super.onStop();
+    }
+
     private View createContentView() {
         int padding = dp(20);
-
         ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
         scrollView.setBackgroundColor(0xFFF8FAFC);
@@ -117,10 +111,8 @@ public class MainActivity extends Activity {
         title.setTextColor(0xFF111827);
         root.addView(title);
 
-        TextView subtitle = new TextView(this);
-        subtitle.setText("MP4はAndroid公式Media3でH.265変換します。\nAVIはFFmpeg互換ルートを使用します。v1.2.0");
+        TextView subtitle = makeInfoText("MP4はAndroid公式Media3でH.265変換します。\nバックグラウンド変換・進行バー対応 v1.3.0");
         subtitle.setTextSize(15);
-        subtitle.setTextColor(0xFF475569);
         subtitle.setPadding(0, dp(6), 0, dp(18));
         root.addView(subtitle);
 
@@ -136,35 +128,32 @@ public class MainActivity extends Activity {
         root.addView(presetLabel);
 
         presetSpinner = new Spinner(this);
-        ArrayAdapter<ResolutionPreset> adapter = new ArrayAdapter<>(
-                this,
-                android.R.layout.simple_spinner_item,
-                ResolutionPreset.values()
-        );
+        ArrayAdapter<ResolutionPreset> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, ResolutionPreset.values());
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         presetSpinner.setAdapter(adapter);
+        presetSpinner.setSelection(ResolutionPreset.LOW.ordinal());
         root.addView(presetSpinner);
 
         encodeButton = makeButton("H.265 MP4に変換開始");
-        LinearLayout.LayoutParams encodeParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-        );
+        LinearLayout.LayoutParams encodeParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         encodeParams.setMargins(0, dp(24), 0, 0);
         encodeButton.setLayoutParams(encodeParams);
-        encodeButton.setOnClickListener(v -> startEncode());
+        encodeButton.setOnClickListener(v -> startEncodeService());
         root.addView(encodeButton);
 
-        progressBar = new ProgressBar(this);
-        progressBar.setIndeterminate(true);
-        progressBar.setVisibility(View.GONE);
-        LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-        );
-        progressParams.gravity = Gravity.CENTER_HORIZONTAL;
-        progressParams.setMargins(0, dp(18), 0, dp(6));
-        root.addView(progressBar, progressParams);
+        TextView progressLabel = makeSectionLabel("エンコード進行状況");
+        progressLabel.setPadding(0, dp(22), 0, dp(8));
+        root.addView(progressLabel);
+
+        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progressBar.setMax(100);
+        progressBar.setProgress(0);
+        root.addView(progressBar, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(18)));
+
+        progressText = makeInfoText("0%");
+        progressText.setGravity(Gravity.CENTER_HORIZONTAL);
+        progressText.setPadding(0, dp(8), 0, dp(6));
+        root.addView(progressText);
 
         statusText = makeInfoText("待機中");
         statusText.setGravity(Gravity.CENTER_HORIZONTAL);
@@ -180,6 +169,12 @@ public class MainActivity extends Activity {
         logText.setPadding(dp(12), dp(12), dp(12), dp(12));
         root.addView(logText);
 
+        TextView credit = makeInfoText("© 株式会社NKテクニカルサポート");
+        credit.setGravity(Gravity.CENTER_HORIZONTAL);
+        credit.setTextColor(0xFF64748B);
+        credit.setPadding(0, dp(26), 0, dp(10));
+        root.addView(credit);
+
         return scrollView;
     }
 
@@ -189,14 +184,8 @@ public class MainActivity extends Activity {
         button.setTextSize(16);
         button.setTextColor(0xFFFFFFFF);
         button.setAllCaps(false);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-            button.setBackgroundResource(getResources().getIdentifier("button_bg", "drawable", getPackageName()));
-        }
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-        );
-        button.setLayoutParams(params);
+        button.setBackgroundResource(getResources().getIdentifier("button_bg", "drawable", getPackageName()));
+        button.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         return button;
     }
 
@@ -225,12 +214,7 @@ public class MainActivity extends Activity {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
         intent.setType("video/*");
-        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
-                "video/mp4",
-                "video/avi",
-                "video/x-msvideo",
-                "video/*"
-        });
+        intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"video/mp4", "video/avi", "video/x-msvideo", "video/*"});
         startActivityForResult(intent, REQUEST_PICK_VIDEO);
     }
 
@@ -242,18 +226,14 @@ public class MainActivity extends Activity {
             selectedVideoName = getDisplayName(selectedVideoUri);
             int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
             if (selectedVideoUri != null && flags != 0) {
-                try {
-                    getContentResolver().takePersistableUriPermission(selectedVideoUri, flags);
-                } catch (Exception ignored) {
-                    // Some providers do not support persistable permissions. Immediate encoding still works.
-                }
+                try { getContentResolver().takePersistableUriPermission(selectedVideoUri, flags); } catch (Exception ignored) {}
             }
             fileText.setText("選択中: " + selectedVideoName);
             appendLog("動画を選択しました: " + selectedVideoName);
         }
     }
 
-    private void startEncode() {
+    private void startEncodeService() {
         if (selectedVideoUri == null) {
             Toast.makeText(this, "先に動画を選択してください。", Toast.LENGTH_SHORT).show();
             return;
@@ -266,224 +246,25 @@ public class MainActivity extends Activity {
         ResolutionPreset preset = (ResolutionPreset) presetSpinner.getSelectedItem();
         if (preset == null) preset = ResolutionPreset.LOW;
 
-        setBusy(true, "入力ファイルを準備中...");
+        updateProgress(0);
+        setBusy(true, "バックグラウンドエンコードを開始します...");
         appendLog("変換プリセット: " + preset.label);
+        appendLog("バックグラウンドサービスを起動します。");
 
-        ResolutionPreset finalPreset = preset;
-        Thread worker = new Thread(() -> prepareAndRunEncode(finalPreset), "nk-encoder-worker");
-        worker.start();
+        Intent serviceIntent = new Intent(this, EncodeForegroundService.class);
+        serviceIntent.setAction(EncodeForegroundService.ACTION_START);
+        serviceIntent.putExtra(EncodeForegroundService.EXTRA_URI, selectedVideoUri);
+        serviceIntent.putExtra(EncodeForegroundService.EXTRA_NAME, selectedVideoName);
+        serviceIntent.putExtra(EncodeForegroundService.EXTRA_PRESET, preset.name());
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(serviceIntent);
+        else startService(serviceIntent);
     }
 
-    private void prepareAndRunEncode(ResolutionPreset preset) {
-        File inputFile = null;
-        try {
-            inputFile = copyUriToCache(selectedVideoUri, selectedVideoName);
-            if (!inputFile.exists() || inputFile.length() == 0) {
-                throw new IOException("入力ファイルのコピーに失敗しました。");
-            }
-
-            final File preparedInputFile = inputFile;
-            final File outputFile = createOutputFile(preset);
-
-            if (isMp4Like(preparedInputFile.getName())) {
-                runOnUiThread(() -> {
-                    statusText.setText("Media3で変換中... 画面を閉じずにお待ちください。");
-                    appendLog("Media3開始 / FFmpegKitは使用しません");
-                    appendLog("入力サイズ: " + formatBytes(preparedInputFile.length()));
-                    appendLog("出力予定: " + outputFile.getName());
-                    appendLog("出力コーデック: H.265 / HEVC, 音声: AAC");
-                });
-                runMedia3Encode(preparedInputFile, outputFile, preset);
-            } else {
-                runOnUiThread(() -> {
-                    statusText.setText("FFmpeg互換ルートで変換中...");
-                    appendLog("AVI/非MP4のためFFmpeg互換ルートを使用します");
-                    appendLog("入力サイズ: " + formatBytes(preparedInputFile.length()));
-                    appendLog("出力予定: " + outputFile.getName());
-                });
-                runFfmpegEncode(preparedInputFile, outputFile, preset);
-            }
-        } catch (Throwable e) {
-            deleteQuietly(inputFile);
-            runOnUiThread(() -> {
-                setBusy(false, "エラー: " + safeMessage(e));
-                appendLog("エラー: " + e);
-            });
-        }
-    }
-
-    private void runMedia3Encode(File inputFile, File outputFile, ResolutionPreset preset) {
-        runOnUiThread(() -> {
-            try {
-                MediaItem mediaItem = MediaItem.fromUri(Uri.fromFile(inputFile));
-                EditedMediaItem editedMediaItem = new EditedMediaItem.Builder(mediaItem)
-                        .setEffects(new Effects(
-                                Collections.emptyList(),
-                                Collections.singletonList(Presentation.createForHeight(preset.height))))
-                        .build();
-
-                media3Transformer = new Transformer.Builder(this)
-                        .setVideoMimeType(MimeTypes.VIDEO_H265)
-                        .setAudioMimeType(MimeTypes.AUDIO_AAC)
-                        .build();
-
-                media3Transformer.addListener(new Transformer.Listener() {
-                    @Override
-                    public void onCompleted(Composition composition, ExportResult exportResult) {
-                        handleEncodeSuccess(inputFile, outputFile, "Media3変換成功");
-                    }
-
-                    @Override
-                    public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
-                        deleteQuietly(inputFile);
-                        runOnUiThread(() -> {
-                            setBusy(false, "Media3変換に失敗しました: " + safeMessage(exportException));
-                            appendLog("Media3 error: " + exportException);
-                        });
-                    }
-                });
-
-                media3Transformer.start(editedMediaItem, outputFile.getAbsolutePath());
-            } catch (Throwable transformerStartError) {
-                deleteQuietly(inputFile);
-                setBusy(false, "Media3を開始できませんでした: " + safeMessage(transformerStartError));
-                appendLog("Media3 start error: " + transformerStartError);
-            }
-        });
-    }
-
-    private void runFfmpegEncode(File inputFile, File outputFile, ResolutionPreset preset) {
-        String[] args = buildFfmpegArguments(inputFile, outputFile, preset);
-        try {
-            FFmpegKit.executeWithArgumentsAsync(args, session -> {
-                try {
-                    if (ReturnCode.isSuccess(session.getReturnCode()) && outputFile.exists() && outputFile.length() > 0) {
-                        handleEncodeSuccess(inputFile, outputFile, "FFmpeg互換ルート変換成功");
-                    } else {
-                        runOnUiThread(() -> {
-                            setBusy(false, "変換に失敗しました。FFmpegKitがこの端末で起動できない可能性があります。");
-                            appendLog("変換失敗: returnCode=" + session.getReturnCode());
-                            if (!TextUtils.isEmpty(session.getFailStackTrace())) {
-                                appendLog(session.getFailStackTrace());
-                            }
-                        });
-                    }
-                } catch (Throwable callbackError) {
-                    runOnUiThread(() -> {
-                        setBusy(false, "終了処理でエラー: " + safeMessage(callbackError));
-                        appendLog("callbackError: " + callbackError);
-                    });
-                } finally {
-                    deleteQuietly(inputFile);
-                }
-            });
-        } catch (Throwable ffmpegStartError) {
-            deleteQuietly(inputFile);
-            runOnUiThread(() -> {
-                setBusy(false, "FFmpegKitを開始できませんでした。MP4はMedia3で再試行してください。");
-                appendLog("ffmpegStartError: " + ffmpegStartError);
-            });
-        }
-    }
-
-    private void handleEncodeSuccess(File inputFile, File outputFile, String label) {
-        Uri savedUri = saveToMediaStore(outputFile);
-        deleteQuietly(inputFile);
-        runOnUiThread(() -> {
-            setBusy(false, "完了: Movies / NK Encoder に保存しました。" +
-                    (savedUri != null ? "\n保存URI: " + savedUri : ""));
-            appendLog(label + ": " + outputFile.getAbsolutePath());
-            appendLog("出力サイズ: " + formatBytes(outputFile.length()));
-        });
-    }
-
-    private String[] buildFfmpegArguments(File inputFile, File outputFile, ResolutionPreset preset) {
-        String scaleFilter = "scale=w='min(" + preset.width + ",iw)':h='min(" + preset.height + ",ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p";
-        return new String[]{
-                "-y",
-                "-nostdin",
-                "-hide_banner",
-                "-i", inputFile.getAbsolutePath(),
-                "-map", "0:v:0",
-                "-map", "0:a?",
-                "-dn",
-                "-sn",
-                "-vf", scaleFilter,
-                "-c:v", "libx265",
-                "-tag:v", "hvc1",
-                "-preset", preset.speedPreset,
-                "-crf", String.valueOf(preset.crf),
-                "-threads", "1",
-                "-x265-params", "log-level=error:pools=1:frame-threads=1:wpp=0",
-                "-c:a", "aac",
-                "-b:a", preset.audioBitrate,
-                "-ac", "2",
-                "-map_metadata", "-1",
-                "-max_muxing_queue_size", "9999",
-                "-movflags", "+faststart",
-                outputFile.getAbsolutePath()
-        };
-    }
-
-    private File copyUriToCache(Uri uri, String displayName) throws IOException {
-        String extension = getSafeExtension(displayName);
-        File inputFile = new File(getCacheDir(), "nk_encoder_input_" + System.currentTimeMillis() + extension);
-        try (InputStream in = getContentResolver().openInputStream(uri);
-             OutputStream out = new FileOutputStream(inputFile)) {
-            if (in == null) throw new IOException("入力ファイルを開けませんでした。");
-            byte[] buffer = new byte[COPY_BUFFER_SIZE];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                out.write(buffer, 0, read);
-            }
-        }
-        return inputFile;
-    }
-
-    private File createOutputFile(ResolutionPreset preset) throws IOException {
-        File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-        if (dir == null) dir = getFilesDir();
-        File encoderDir = new File(dir, "NK_Encoder");
-        if (!encoderDir.exists() && !encoderDir.mkdirs()) {
-            throw new IOException("出力フォルダを作成できませんでした。");
-        }
-        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        return new File(encoderDir, "encoded_" + preset.name().toLowerCase(Locale.US) + "_" + timestamp + ".mp4");
-    }
-
-    private Uri saveToMediaStore(File file) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            return Uri.fromFile(file);
-        }
-        ContentResolver resolver = getContentResolver();
-        ContentValues values = new ContentValues();
-        values.put(MediaStore.Video.Media.DISPLAY_NAME, file.getName());
-        values.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-        values.put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/NK Encoder");
-        values.put(MediaStore.Video.Media.IS_PENDING, 1);
-
-        Uri uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values);
-        if (uri == null) return null;
-
-        try (InputStream in = new FileInputStream(file);
-             OutputStream out = resolver.openOutputStream(uri)) {
-            if (out == null) return null;
-            byte[] buffer = new byte[COPY_BUFFER_SIZE];
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                out.write(buffer, 0, read);
-            }
-            values.clear();
-            values.put(MediaStore.Video.Media.IS_PENDING, 0);
-            resolver.update(uri, values, null, null);
-            return uri;
-        } catch (Exception e) {
-            values.clear();
-            values.put(MediaStore.Video.Media.IS_PENDING, 0);
-            resolver.update(uri, values, null, null);
-            appendLogOnUiThread("MediaStore保存エラー: " + e);
-            return null;
-        }
+    private void updateProgress(int progress) {
+        int safe = Math.max(0, Math.min(100, progress));
+        progressBar.setProgress(safe);
+        progressText.setText(safe + "%");
     }
 
     private String getDisplayName(Uri uri) {
@@ -496,26 +277,8 @@ public class MainActivity extends Activity {
                     if (!TextUtils.isEmpty(name)) return name;
                 }
             }
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         return "unknown_video";
-    }
-
-    private String getSafeExtension(String displayName) {
-        if (displayName == null) return ".mp4";
-        String lower = displayName.toLowerCase(Locale.US);
-        if (lower.endsWith(".avi")) return ".avi";
-        if (lower.endsWith(".mp4")) return ".mp4";
-        if (lower.endsWith(".m4v")) return ".m4v";
-        if (lower.endsWith(".mov")) return ".mov";
-        if (lower.endsWith(".mkv")) return ".mkv";
-        return ".mp4";
-    }
-
-    private boolean isMp4Like(String filename) {
-        if (filename == null) return true;
-        String lower = filename.toLowerCase(Locale.US);
-        return lower.endsWith(".mp4") || lower.endsWith(".m4v") || lower.endsWith(".mov");
     }
 
     private void setBusy(boolean busy, String status) {
@@ -523,7 +286,6 @@ public class MainActivity extends Activity {
         pickButton.setEnabled(!busy);
         encodeButton.setEnabled(!busy);
         presetSpinner.setEnabled(!busy);
-        progressBar.setVisibility(busy ? View.VISIBLE : View.GONE);
         statusText.setText(status);
     }
 
@@ -531,32 +293,6 @@ public class MainActivity extends Activity {
         String current = logText.getText().toString();
         if ("ここに変換状況が表示されます。".equals(current)) current = "";
         logText.setText(current + (current.isEmpty() ? "" : "\n") + message);
-    }
-
-    private void appendLogOnUiThread(String message) {
-        runOnUiThread(() -> appendLog(message));
-    }
-
-    private String formatBytes(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        double kb = bytes / 1024.0;
-        if (kb < 1024) return String.format(Locale.US, "%.1f KB", kb);
-        double mb = kb / 1024.0;
-        if (mb < 1024) return String.format(Locale.US, "%.1f MB", mb);
-        return String.format(Locale.US, "%.2f GB", mb / 1024.0);
-    }
-
-    private String safeMessage(Throwable throwable) {
-        if (throwable == null) return "unknown";
-        String message = throwable.getMessage();
-        return TextUtils.isEmpty(message) ? throwable.getClass().getSimpleName() : message;
-    }
-
-    private void deleteQuietly(File file) {
-        if (file != null && file.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            file.delete();
-        }
     }
 
     private int dp(int value) {
