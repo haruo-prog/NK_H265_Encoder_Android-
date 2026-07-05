@@ -24,6 +24,16 @@ import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.effect.Presentation;
+import androidx.media3.transformer.Composition;
+import androidx.media3.transformer.EditedMediaItem;
+import androidx.media3.transformer.Effects;
+import androidx.media3.transformer.ExportException;
+import androidx.media3.transformer.ExportResult;
+import androidx.media3.transformer.Transformer;
+
 import com.arthenica.ffmpegkit.FFmpegKit;
 import com.arthenica.ffmpegkit.ReturnCode;
 
@@ -34,6 +44,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
+import java.util.Collections;
 import java.util.Date;
 import java.util.Locale;
 
@@ -44,6 +55,7 @@ public class MainActivity extends Activity {
     private Uri selectedVideoUri;
     private String selectedVideoName = "";
     private volatile boolean encodingInProgress = false;
+    private Transformer media3Transformer;
 
     private TextView fileText;
     private Spinner presetSpinner;
@@ -106,7 +118,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("MP4 / AVI を読み込み、MP4 H.265（HEVC）へ変換します。\n修正版: 低解像度変換時のクラッシュ対策済み");
+        subtitle.setText("MP4はAndroid公式Media3でH.265変換します。\nAVIはFFmpeg互換ルートを使用します。v1.2.0");
         subtitle.setTextSize(15);
         subtitle.setTextColor(0xFF475569);
         subtitle.setPadding(0, dp(6), 0, dp(18));
@@ -272,52 +284,24 @@ public class MainActivity extends Activity {
 
             final File preparedInputFile = inputFile;
             final File outputFile = createOutputFile(preset);
-            String[] args = buildFfmpegArguments(preparedInputFile, outputFile, preset);
 
-            runOnUiThread(() -> {
-                statusText.setText("変換中... 画面を閉じずにお待ちください。");
-                appendLog("FFmpeg開始");
-                appendLog("入力サイズ: " + formatBytes(preparedInputFile.length()));
-                appendLog("出力予定: " + outputFile.getName());
-                appendLog("x265安定化: threads=1 / frame-threads=1");
-            });
-
-            final File finalInputFile = preparedInputFile;
-            try {
-                FFmpegKit.executeWithArgumentsAsync(args, session -> {
-                    try {
-                        if (ReturnCode.isSuccess(session.getReturnCode()) && outputFile.exists() && outputFile.length() > 0) {
-                            Uri savedUri = saveToMediaStore(outputFile);
-                            runOnUiThread(() -> {
-                                setBusy(false, "完了: Movies / NK Encoder に保存しました。" +
-                                        (savedUri != null ? "\n保存URI: " + savedUri : ""));
-                                appendLog("変換成功: " + outputFile.getAbsolutePath());
-                                appendLog("出力サイズ: " + formatBytes(outputFile.length()));
-                            });
-                        } else {
-                            runOnUiThread(() -> {
-                                setBusy(false, "変換に失敗しました。動画形式または端末性能が原因の可能性があります。");
-                                appendLog("変換失敗: returnCode=" + session.getReturnCode());
-                                if (!TextUtils.isEmpty(session.getFailStackTrace())) {
-                                    appendLog(session.getFailStackTrace());
-                                }
-                            });
-                        }
-                    } catch (Throwable callbackError) {
-                        runOnUiThread(() -> {
-                            setBusy(false, "終了処理でエラー: " + safeMessage(callbackError));
-                            appendLog("callbackError: " + callbackError);
-                        });
-                    } finally {
-                        deleteQuietly(finalInputFile);
-                    }
-                });
-            } catch (Throwable ffmpegStartError) {
-                deleteQuietly(finalInputFile);
+            if (isMp4Like(preparedInputFile.getName())) {
                 runOnUiThread(() -> {
-                    setBusy(false, "FFmpegを開始できませんでした: " + safeMessage(ffmpegStartError));
-                    appendLog("ffmpegStartError: " + ffmpegStartError);
+                    statusText.setText("Media3で変換中... 画面を閉じずにお待ちください。");
+                    appendLog("Media3開始 / FFmpegKitは使用しません");
+                    appendLog("入力サイズ: " + formatBytes(preparedInputFile.length()));
+                    appendLog("出力予定: " + outputFile.getName());
+                    appendLog("出力コーデック: H.265 / HEVC, 音声: AAC");
                 });
+                runMedia3Encode(preparedInputFile, outputFile, preset);
+            } else {
+                runOnUiThread(() -> {
+                    statusText.setText("FFmpeg互換ルートで変換中...");
+                    appendLog("AVI/非MP4のためFFmpeg互換ルートを使用します");
+                    appendLog("入力サイズ: " + formatBytes(preparedInputFile.length()));
+                    appendLog("出力予定: " + outputFile.getName());
+                });
+                runFfmpegEncode(preparedInputFile, outputFile, preset);
             }
         } catch (Throwable e) {
             deleteQuietly(inputFile);
@@ -326,6 +310,91 @@ public class MainActivity extends Activity {
                 appendLog("エラー: " + e);
             });
         }
+    }
+
+    private void runMedia3Encode(File inputFile, File outputFile, ResolutionPreset preset) {
+        runOnUiThread(() -> {
+            try {
+                MediaItem mediaItem = MediaItem.fromUri(Uri.fromFile(inputFile));
+                EditedMediaItem editedMediaItem = new EditedMediaItem.Builder(mediaItem)
+                        .setEffects(new Effects(
+                                Collections.emptyList(),
+                                Collections.singletonList(Presentation.createForHeight(preset.height))))
+                        .build();
+
+                media3Transformer = new Transformer.Builder(this)
+                        .setVideoMimeType(MimeTypes.VIDEO_H265)
+                        .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                        .build();
+
+                media3Transformer.addListener(new Transformer.Listener() {
+                    @Override
+                    public void onCompleted(Composition composition, ExportResult exportResult) {
+                        handleEncodeSuccess(inputFile, outputFile, "Media3変換成功");
+                    }
+
+                    @Override
+                    public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
+                        deleteQuietly(inputFile);
+                        runOnUiThread(() -> {
+                            setBusy(false, "Media3変換に失敗しました: " + safeMessage(exportException));
+                            appendLog("Media3 error: " + exportException);
+                        });
+                    }
+                });
+
+                media3Transformer.start(editedMediaItem, outputFile.getAbsolutePath());
+            } catch (Throwable transformerStartError) {
+                deleteQuietly(inputFile);
+                setBusy(false, "Media3を開始できませんでした: " + safeMessage(transformerStartError));
+                appendLog("Media3 start error: " + transformerStartError);
+            }
+        });
+    }
+
+    private void runFfmpegEncode(File inputFile, File outputFile, ResolutionPreset preset) {
+        String[] args = buildFfmpegArguments(inputFile, outputFile, preset);
+        try {
+            FFmpegKit.executeWithArgumentsAsync(args, session -> {
+                try {
+                    if (ReturnCode.isSuccess(session.getReturnCode()) && outputFile.exists() && outputFile.length() > 0) {
+                        handleEncodeSuccess(inputFile, outputFile, "FFmpeg互換ルート変換成功");
+                    } else {
+                        runOnUiThread(() -> {
+                            setBusy(false, "変換に失敗しました。FFmpegKitがこの端末で起動できない可能性があります。");
+                            appendLog("変換失敗: returnCode=" + session.getReturnCode());
+                            if (!TextUtils.isEmpty(session.getFailStackTrace())) {
+                                appendLog(session.getFailStackTrace());
+                            }
+                        });
+                    }
+                } catch (Throwable callbackError) {
+                    runOnUiThread(() -> {
+                        setBusy(false, "終了処理でエラー: " + safeMessage(callbackError));
+                        appendLog("callbackError: " + callbackError);
+                    });
+                } finally {
+                    deleteQuietly(inputFile);
+                }
+            });
+        } catch (Throwable ffmpegStartError) {
+            deleteQuietly(inputFile);
+            runOnUiThread(() -> {
+                setBusy(false, "FFmpegKitを開始できませんでした。MP4はMedia3で再試行してください。");
+                appendLog("ffmpegStartError: " + ffmpegStartError);
+            });
+        }
+    }
+
+    private void handleEncodeSuccess(File inputFile, File outputFile, String label) {
+        Uri savedUri = saveToMediaStore(outputFile);
+        deleteQuietly(inputFile);
+        runOnUiThread(() -> {
+            setBusy(false, "完了: Movies / NK Encoder に保存しました。" +
+                    (savedUri != null ? "\n保存URI: " + savedUri : ""));
+            appendLog(label + ": " + outputFile.getAbsolutePath());
+            appendLog("出力サイズ: " + formatBytes(outputFile.length()));
+        });
     }
 
     private String[] buildFfmpegArguments(File inputFile, File outputFile, ResolutionPreset preset) {
@@ -437,9 +506,16 @@ public class MainActivity extends Activity {
         String lower = displayName.toLowerCase(Locale.US);
         if (lower.endsWith(".avi")) return ".avi";
         if (lower.endsWith(".mp4")) return ".mp4";
+        if (lower.endsWith(".m4v")) return ".m4v";
         if (lower.endsWith(".mov")) return ".mov";
         if (lower.endsWith(".mkv")) return ".mkv";
         return ".mp4";
+    }
+
+    private boolean isMp4Like(String filename) {
+        if (filename == null) return true;
+        String lower = filename.toLowerCase(Locale.US);
+        return lower.endsWith(".mp4") || lower.endsWith(".m4v") || lower.endsWith(".mov");
     }
 
     private void setBusy(boolean busy, String status) {
