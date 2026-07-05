@@ -39,9 +39,11 @@ import java.util.Locale;
 
 public class MainActivity extends Activity {
     private static final int REQUEST_PICK_VIDEO = 1001;
+    private static final int COPY_BUFFER_SIZE = 256 * 1024;
 
     private Uri selectedVideoUri;
     private String selectedVideoName = "";
+    private volatile boolean encodingInProgress = false;
 
     private TextView fileText;
     private Spinner presetSpinner;
@@ -52,9 +54,9 @@ public class MainActivity extends Activity {
     private Button encodeButton;
 
     private enum ResolutionPreset {
-        HIGH("高解像度 1080p目安", 1920, 1080, 23, "medium", "160k"),
-        MEDIUM("中解像度 720p目安", 1280, 720, 26, "fast", "128k"),
-        LOW("低解像度 480p目安", 854, 480, 30, "faster", "96k");
+        HIGH("高解像度 1080p目安", 1920, 1080, 24, "veryfast", "160k"),
+        MEDIUM("中解像度 720p目安", 1280, 720, 27, "veryfast", "128k"),
+        LOW("低解像度 480p目安", 854, 480, 31, "ultrafast", "96k");
 
         final String label;
         final int width;
@@ -104,7 +106,7 @@ public class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("MP4 / AVI を読み込み、MP4 H.265（HEVC）へ変換します。");
+        subtitle.setText("MP4 / AVI を読み込み、MP4 H.265（HEVC）へ変換します。\n修正版: 低解像度変換時のクラッシュ対策済み");
         subtitle.setTextSize(15);
         subtitle.setTextColor(0xFF475569);
         subtitle.setPadding(0, dp(6), 0, dp(18));
@@ -204,9 +206,13 @@ public class MainActivity extends Activity {
     }
 
     private void pickVideo() {
+        if (encodingInProgress) {
+            Toast.makeText(this, "変換中は動画を変更できません。", Toast.LENGTH_SHORT).show();
+            return;
+        }
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE);
-        intent.setType("*/*");
+        intent.setType("video/*");
         intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
                 "video/mp4",
                 "video/avi",
@@ -223,10 +229,12 @@ public class MainActivity extends Activity {
             selectedVideoUri = data.getData();
             selectedVideoName = getDisplayName(selectedVideoUri);
             int flags = data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION;
-            try {
-                getContentResolver().takePersistableUriPermission(selectedVideoUri, flags);
-            } catch (Exception ignored) {
-                // Some providers do not support persistable permissions. Immediate encoding still works.
+            if (selectedVideoUri != null && flags != 0) {
+                try {
+                    getContentResolver().takePersistableUriPermission(selectedVideoUri, flags);
+                } catch (Exception ignored) {
+                    // Some providers do not support persistable permissions. Immediate encoding still works.
+                }
             }
             fileText.setText("選択中: " + selectedVideoName);
             appendLog("動画を選択しました: " + selectedVideoName);
@@ -238,72 +246,113 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "先に動画を選択してください。", Toast.LENGTH_SHORT).show();
             return;
         }
+        if (encodingInProgress) {
+            Toast.makeText(this, "現在変換中です。", Toast.LENGTH_SHORT).show();
+            return;
+        }
 
         ResolutionPreset preset = (ResolutionPreset) presetSpinner.getSelectedItem();
+        if (preset == null) preset = ResolutionPreset.LOW;
+
         setBusy(true, "入力ファイルを準備中...");
         appendLog("変換プリセット: " + preset.label);
 
-        new Thread(() -> {
-            File inputFile = null;
-            try {
-                inputFile = copyUriToCache(selectedVideoUri, selectedVideoName);
-                File outputFile = createOutputFile(preset);
-                String command = buildFfmpegCommand(inputFile, outputFile, preset);
-
-                runOnUiThread(() -> {
-                    statusText.setText("変換中...");
-                    appendLog("FFmpeg開始");
-                    appendLog(command);
-                });
-
-                File finalInputFile = inputFile;
-                FFmpegKit.executeAsync(command, session -> {
-                    if (ReturnCode.isSuccess(session.getReturnCode())) {
-                        Uri savedUri = saveToMediaStore(outputFile);
-                        runOnUiThread(() -> {
-                            setBusy(false, "完了: Movies / NK Encoder に保存しました。" +
-                                    (savedUri != null ? "\n保存URI: " + savedUri : ""));
-                            appendLog("変換成功: " + outputFile.getAbsolutePath());
-                        });
-                    } else {
-                        runOnUiThread(() -> {
-                            setBusy(false, "変換に失敗しました。ログを確認してください。");
-                            appendLog("変換失敗: returnCode=" + session.getReturnCode());
-                            if (!TextUtils.isEmpty(session.getFailStackTrace())) {
-                                appendLog(session.getFailStackTrace());
-                            }
-                        });
-                    }
-                    if (finalInputFile.exists()) {
-                        //noinspection ResultOfMethodCallIgnored
-                        finalInputFile.delete();
-                    }
-                });
-            } catch (Exception e) {
-                File finalInputFile = inputFile;
-                runOnUiThread(() -> {
-                    setBusy(false, "エラー: " + e.getMessage());
-                    appendLog("エラー: " + e);
-                });
-                if (finalInputFile != null && finalInputFile.exists()) {
-                    //noinspection ResultOfMethodCallIgnored
-                    finalInputFile.delete();
-                }
-            }
-        }).start();
+        ResolutionPreset finalPreset = preset;
+        Thread worker = new Thread(() -> prepareAndRunEncode(finalPreset), "nk-encoder-worker");
+        worker.start();
     }
 
-    private String buildFfmpegCommand(File inputFile, File outputFile, ResolutionPreset preset) {
-        String scaleFilter = "scale='min(" + preset.width + ",iw)':'min(" + preset.height + ",ih)':force_original_aspect_ratio=decrease:force_divisible_by=2";
-        return "-y " +
-                "-i " + shellPath(inputFile.getAbsolutePath()) + " " +
-                "-map 0:v:0 -map 0:a? " +
-                "-vf " + quote(scaleFilter) + " " +
-                "-c:v libx265 -tag:v hvc1 -pix_fmt yuv420p " +
-                "-preset " + preset.speedPreset + " -crf " + preset.crf + " " +
-                "-c:a aac -b:a " + preset.audioBitrate + " -ac 2 " +
-                "-movflags +faststart " +
-                shellPath(outputFile.getAbsolutePath());
+    private void prepareAndRunEncode(ResolutionPreset preset) {
+        File inputFile = null;
+        try {
+            inputFile = copyUriToCache(selectedVideoUri, selectedVideoName);
+            if (!inputFile.exists() || inputFile.length() == 0) {
+                throw new IOException("入力ファイルのコピーに失敗しました。");
+            }
+
+            File outputFile = createOutputFile(preset);
+            String[] args = buildFfmpegArguments(inputFile, outputFile, preset);
+
+            runOnUiThread(() -> {
+                statusText.setText("変換中... 画面を閉じずにお待ちください。");
+                appendLog("FFmpeg開始");
+                appendLog("入力サイズ: " + formatBytes(inputFile.length()));
+                appendLog("出力予定: " + outputFile.getName());
+                appendLog("x265安定化: threads=1 / frame-threads=1");
+            });
+
+            File finalInputFile = inputFile;
+            try {
+                FFmpegKit.executeWithArgumentsAsync(args, session -> {
+                    try {
+                        if (ReturnCode.isSuccess(session.getReturnCode()) && outputFile.exists() && outputFile.length() > 0) {
+                            Uri savedUri = saveToMediaStore(outputFile);
+                            runOnUiThread(() -> {
+                                setBusy(false, "完了: Movies / NK Encoder に保存しました。" +
+                                        (savedUri != null ? "\n保存URI: " + savedUri : ""));
+                                appendLog("変換成功: " + outputFile.getAbsolutePath());
+                                appendLog("出力サイズ: " + formatBytes(outputFile.length()));
+                            });
+                        } else {
+                            runOnUiThread(() -> {
+                                setBusy(false, "変換に失敗しました。動画形式または端末性能が原因の可能性があります。");
+                                appendLog("変換失敗: returnCode=" + session.getReturnCode());
+                                if (!TextUtils.isEmpty(session.getFailStackTrace())) {
+                                    appendLog(session.getFailStackTrace());
+                                }
+                            });
+                        }
+                    } catch (Throwable callbackError) {
+                        runOnUiThread(() -> {
+                            setBusy(false, "終了処理でエラー: " + safeMessage(callbackError));
+                            appendLog("callbackError: " + callbackError);
+                        });
+                    } finally {
+                        deleteQuietly(finalInputFile);
+                    }
+                });
+            } catch (Throwable ffmpegStartError) {
+                deleteQuietly(finalInputFile);
+                runOnUiThread(() -> {
+                    setBusy(false, "FFmpegを開始できませんでした: " + safeMessage(ffmpegStartError));
+                    appendLog("ffmpegStartError: " + ffmpegStartError);
+                });
+            }
+        } catch (Throwable e) {
+            deleteQuietly(inputFile);
+            runOnUiThread(() -> {
+                setBusy(false, "エラー: " + safeMessage(e));
+                appendLog("エラー: " + e);
+            });
+        }
+    }
+
+    private String[] buildFfmpegArguments(File inputFile, File outputFile, ResolutionPreset preset) {
+        String scaleFilter = "scale=w='min(" + preset.width + ",iw)':h='min(" + preset.height + ",ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p";
+        return new String[]{
+                "-y",
+                "-nostdin",
+                "-hide_banner",
+                "-i", inputFile.getAbsolutePath(),
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-dn",
+                "-sn",
+                "-vf", scaleFilter,
+                "-c:v", "libx265",
+                "-tag:v", "hvc1",
+                "-preset", preset.speedPreset,
+                "-crf", String.valueOf(preset.crf),
+                "-threads", "1",
+                "-x265-params", "log-level=error:pools=1:frame-threads=1:wpp=0",
+                "-c:a", "aac",
+                "-b:a", preset.audioBitrate,
+                "-ac", "2",
+                "-map_metadata", "-1",
+                "-max_muxing_queue_size", "9999",
+                "-movflags", "+faststart",
+                outputFile.getAbsolutePath()
+        };
     }
 
     private File copyUriToCache(Uri uri, String displayName) throws IOException {
@@ -312,7 +361,7 @@ public class MainActivity extends Activity {
         try (InputStream in = getContentResolver().openInputStream(uri);
              OutputStream out = new FileOutputStream(inputFile)) {
             if (in == null) throw new IOException("入力ファイルを開けませんでした。");
-            byte[] buffer = new byte[1024 * 1024];
+            byte[] buffer = new byte[COPY_BUFFER_SIZE];
             int read;
             while ((read = in.read(buffer)) != -1) {
                 out.write(buffer, 0, read);
@@ -349,7 +398,7 @@ public class MainActivity extends Activity {
         try (InputStream in = new FileInputStream(file);
              OutputStream out = resolver.openOutputStream(uri)) {
             if (out == null) return null;
-            byte[] buffer = new byte[1024 * 1024];
+            byte[] buffer = new byte[COPY_BUFFER_SIZE];
             int read;
             while ((read = in.read(buffer)) != -1) {
                 out.write(buffer, 0, read);
@@ -359,6 +408,10 @@ public class MainActivity extends Activity {
             resolver.update(uri, values, null, null);
             return uri;
         } catch (Exception e) {
+            values.clear();
+            values.put(MediaStore.Video.Media.IS_PENDING, 0);
+            resolver.update(uri, values, null, null);
+            appendLogOnUiThread("MediaStore保存エラー: " + e);
             return null;
         }
     }
@@ -388,15 +441,8 @@ public class MainActivity extends Activity {
         return ".mp4";
     }
 
-    private String shellPath(String path) {
-        return quote(path);
-    }
-
-    private String quote(String text) {
-        return "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
-    }
-
     private void setBusy(boolean busy, String status) {
+        encodingInProgress = busy;
         pickButton.setEnabled(!busy);
         encodeButton.setEnabled(!busy);
         presetSpinner.setEnabled(!busy);
@@ -408,6 +454,32 @@ public class MainActivity extends Activity {
         String current = logText.getText().toString();
         if ("ここに変換状況が表示されます。".equals(current)) current = "";
         logText.setText(current + (current.isEmpty() ? "" : "\n") + message);
+    }
+
+    private void appendLogOnUiThread(String message) {
+        runOnUiThread(() -> appendLog(message));
+    }
+
+    private String formatBytes(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        double kb = bytes / 1024.0;
+        if (kb < 1024) return String.format(Locale.US, "%.1f KB", kb);
+        double mb = kb / 1024.0;
+        if (mb < 1024) return String.format(Locale.US, "%.1f MB", mb);
+        return String.format(Locale.US, "%.2f GB", mb / 1024.0);
+    }
+
+    private String safeMessage(Throwable throwable) {
+        if (throwable == null) return "unknown";
+        String message = throwable.getMessage();
+        return TextUtils.isEmpty(message) ? throwable.getClass().getSimpleName() : message;
+    }
+
+    private void deleteQuietly(File file) {
+        if (file != null && file.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            file.delete();
+        }
     }
 
     private int dp(int value) {
