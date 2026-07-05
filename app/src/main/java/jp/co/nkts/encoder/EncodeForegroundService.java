@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.media.MediaCodecInfo;
 import android.media.MediaCodecList;
 import android.media.MediaFormat;
@@ -41,18 +42,23 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.Locale;
 
 public class EncodeForegroundService extends Service {
     public static final String ACTION_START = "jp.co.nkts.encoder.action.START";
+    public static final String ACTION_CANCEL = "jp.co.nkts.encoder.action.CANCEL";
     public static final String ACTION_STATUS = "jp.co.nkts.encoder.action.STATUS";
-    public static final String EXTRA_URI = "extra_uri";
-    public static final String EXTRA_NAME = "extra_name";
+    public static final String EXTRA_URIS = "extra_uris";
+    public static final String EXTRA_NAMES = "extra_names";
     public static final String EXTRA_PRESET = "extra_preset";
     public static final String EXTRA_MODE = "extra_mode";
+    public static final String EXTRA_BITRATE_KBPS = "extra_bitrate_kbps";
     public static final String EXTRA_MESSAGE = "message";
     public static final String EXTRA_PROGRESS = "progress";
     public static final String EXTRA_DONE = "done";
@@ -64,10 +70,17 @@ public class EncodeForegroundService extends Service {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile boolean running = false;
+    private volatile boolean cancelRequested = false;
     private Transformer transformer;
+    private Runnable progressRunnable;
+    private ArrayList<Uri> queueUris = new ArrayList<>();
+    private ArrayList<String> queueNames = new ArrayList<>();
+    private int totalCount = 0;
+    private int currentIndex = 0;
     private File activeInputFile;
     private File activeOutputFile;
-    private Runnable progressRunnable;
+    private long activeOriginalBytes = 0L;
+    private long activeStartMs = 0L;
 
     public enum Preset {
         HIGH("高解像度 1080p目安", 1920, 1080, 24, "veryfast", "160k"),
@@ -95,89 +108,244 @@ public class EncodeForegroundService extends Service {
         EncodeMode(String label) { this.label = label; }
     }
 
-    @Nullable @Override public IBinder onBind(Intent intent) { return null; }
+    @Nullable
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
 
-    @Override public void onCreate() {
+    @Override
+    public void onCreate() {
         super.onCreate();
         createNotificationChannel();
     }
 
-    @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        if (intent == null || !ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent == null) return START_NOT_STICKY;
+        if (ACTION_CANCEL.equals(intent.getAction())) {
+            cancelCurrent();
+            return START_NOT_STICKY;
+        }
+        if (!ACTION_START.equals(intent.getAction())) return START_NOT_STICKY;
         if (running) {
-            broadcast("すでにエンコード中です。", 0, false, false);
+            broadcast("すでにエンコード中です。", currentOverallProgress(0), false, false);
             return START_STICKY;
         }
-        Uri uri = intent.getParcelableExtra(EXTRA_URI);
-        String name = intent.getStringExtra(EXTRA_NAME);
+
+        ArrayList<Uri> uris = intent.getParcelableArrayListExtra(EXTRA_URIS);
+        ArrayList<String> names = intent.getStringArrayListExtra(EXTRA_NAMES);
+        if (uris == null || uris.isEmpty()) {
+            broadcast("入力動画がありません。", 0, true, false);
+            return START_NOT_STICKY;
+        }
+
+        queueUris = uris;
+        queueNames = names == null ? new ArrayList<>() : names;
+        totalCount = queueUris.size();
+        currentIndex = 0;
+        cancelRequested = false;
+        running = true;
+
         Preset preset = parsePreset(intent.getStringExtra(EXTRA_PRESET));
         EncodeMode mode = parseMode(intent.getStringExtra(EXTRA_MODE));
-        running = true;
-        startForeground(NOTIFICATION_ID, buildNotification("エンコード準備中", 0, false));
-        broadcast("バックグラウンドエンコードを開始しました。", 0, false, false);
-        new Thread(() -> runEncode(uri, name, preset, mode), "nk-encoder-service-worker").start();
+        int bitrateKbps = intent.getIntExtra(EXTRA_BITRATE_KBPS, 0);
+
+        startForeground(NOTIFICATION_ID, buildNotification("一括エンコード準備中", 0, false));
+        broadcast("一括エンコード開始: " + totalCount + "件", 0, false, false);
+        new Thread(() -> processNext(preset, mode, bitrateKbps), "nk-batch-encoder").start();
         return START_STICKY;
     }
 
-    @Override public void onDestroy() {
+    @Override
+    public void onDestroy() {
         stopProgressPolling();
         try { if (transformer != null) transformer.cancel(); } catch (Throwable ignored) {}
         deleteQuietly(activeInputFile);
         super.onDestroy();
     }
 
-    private void runEncode(Uri uri, String displayName, Preset preset, EncodeMode mode) {
+    private void processNext(Preset preset, EncodeMode mode, int bitrateKbps) {
+        if (cancelRequested) {
+            finishCanceled();
+            return;
+        }
+        if (currentIndex >= totalCount) {
+            finishAllSuccess();
+            return;
+        }
+
+        Uri uri = queueUris.get(currentIndex);
+        String name = currentIndex < queueNames.size() ? queueNames.get(currentIndex) : "unknown_video";
+        activeInputFile = null;
+        activeOutputFile = null;
+        activeOriginalBytes = 0L;
+        activeStartMs = System.currentTimeMillis();
+
         try {
-            if (uri == null) throw new IOException("入力URIがありません。");
-            activeInputFile = copyUriToCache(uri, displayName);
+            broadcast("[" + (currentIndex + 1) + "/" + totalCount + "] 準備中: " + name, currentOverallProgress(1), false, false);
+            activeInputFile = copyUriToCache(uri, name);
             if (!activeInputFile.exists() || activeInputFile.length() == 0) throw new IOException("入力ファイルのコピーに失敗しました。");
-            activeOutputFile = createOutputFile(preset, mode);
-            broadcast("入力サイズ: " + formatBytes(activeInputFile.length()), 3, false, false);
-            broadcast("モード: " + mode.label, 4, false, false);
-            broadcast("CPUコア数: " + Runtime.getRuntime().availableProcessors(), 4, false, false);
-            updateNotification("入力ファイル準備完了", 3, false);
+            activeOriginalBytes = activeInputFile.length();
+            activeOutputFile = createOutputFile(preset, mode, bitrateKbps);
+            broadcast("元サイズ: " + formatBytes(activeOriginalBytes), currentOverallProgress(3), false, false);
+            broadcast("指定ビットレート: " + bitrateLabel(bitrateKbps), currentOverallProgress(4), false, false);
+
             if (isMp4Like(activeInputFile.getName())) {
                 String encoder = findHevcEncoderName();
-                broadcast("HEVCエンコーダ候補: " + encoder, 5, false, false);
-                broadcast("Media3 / MediaCodec で高速変換します。", 5, false, false);
-                mainHandler.post(() -> runMedia3Encode(activeInputFile, activeOutputFile, preset, mode, encoder));
+                broadcast("HEVCエンコーダ候補: " + encoder, currentOverallProgress(5), false, false);
+                mainHandler.post(() -> runMedia3Encode(activeInputFile, activeOutputFile, preset, mode, bitrateKbps, name));
             } else {
-                broadcast("AVI/非MP4のためFFmpeg互換ルートを使用します。", 5, false, false);
-                runFfmpegEncode(activeInputFile, activeOutputFile, preset, mode);
+                broadcast("FFmpeg互換ルートで変換します。", currentOverallProgress(5), false, false);
+                runFfmpegEncode(activeInputFile, activeOutputFile, preset, mode, bitrateKbps, name);
             }
         } catch (Throwable e) {
-            finishWithError("エラー: " + safeMessage(e), e);
+            handleItemError(name, e, preset, mode, bitrateKbps);
         }
     }
 
-    private void runMedia3Encode(File inputFile, File outputFile, Preset preset, EncodeMode mode, String encoderName) {
+    private void runMedia3Encode(File inputFile, File outputFile, Preset preset, EncodeMode mode, int bitrateKbps, String displayName) {
         try {
             int targetHeight = effectiveHeight(preset, mode);
-            broadcast("実行解像度: 高さ " + targetHeight + "px", 6, false, false);
-            if (encoderName.toLowerCase(Locale.US).contains("software") || encoderName.toLowerCase(Locale.US).contains("android")) {
-                broadcast("注意: ソフトウェア系エンコーダの可能性があります。", 6, false, false);
+            broadcast("実行解像度: 高さ " + targetHeight + "px", currentOverallProgress(6), false, false);
+            broadcast("Media3 / MediaCodecで変換中", currentOverallProgress(7), false, false);
+            if (bitrateKbps > 0) {
+                broadcast("ビットレート指定はFFmpeg互換ルートで厳密適用。Media3では端末エンコーダ制御優先。", currentOverallProgress(8), false, false);
             }
+
             MediaItem mediaItem = MediaItem.fromUri(Uri.fromFile(inputFile));
             EditedMediaItem editedMediaItem = new EditedMediaItem.Builder(mediaItem)
                     .setEffects(new Effects(Collections.emptyList(), Collections.singletonList(Presentation.createForHeight(targetHeight))))
                     .build();
+
             transformer = new Transformer.Builder(this)
                     .setVideoMimeType(MimeTypes.VIDEO_H265)
                     .setAudioMimeType(MimeTypes.AUDIO_AAC)
                     .build();
+
             transformer.addListener(new Transformer.Listener() {
                 @Override public void onCompleted(Composition composition, ExportResult exportResult) {
-                    finishWithSuccess(inputFile, outputFile, "Media3変換成功 / " + mode.label);
+                    handleItemSuccess(displayName, inputFile, outputFile, preset, mode, bitrateKbps);
                 }
                 @Override public void onError(Composition composition, ExportResult exportResult, ExportException exportException) {
-                    finishWithError("Media3変換に失敗しました: " + safeMessage(exportException), exportException);
+                    handleItemError(displayName, exportException, preset, mode, bitrateKbps);
                 }
             });
+
             transformer.start(editedMediaItem, outputFile.getAbsolutePath());
             startProgressPolling();
         } catch (Throwable e) {
-            finishWithError("Media3を開始できませんでした: " + safeMessage(e), e);
+            handleItemError(displayName, e, preset, mode, bitrateKbps);
         }
+    }
+
+    private void startProgressPolling() {
+        stopProgressPolling();
+        progressRunnable = new Runnable() {
+            @Override public void run() {
+                if (!running || transformer == null || cancelRequested) return;
+                try {
+                    ProgressHolder holder = new ProgressHolder();
+                    int state = transformer.getProgress(holder);
+                    int itemProgress = state == Transformer.PROGRESS_STATE_AVAILABLE ? Math.max(5, Math.min(99, holder.progress)) : 10;
+                    int overall = currentOverallProgress(itemProgress);
+                    broadcast("[" + (currentIndex + 1) + "/" + totalCount + "] エンコード中: " + itemProgress + "%", overall, false, false);
+                    updateNotification("変換中 " + overall + "%", overall, false);
+                } catch (Throwable ignored) {
+                    int overall = currentOverallProgress(10);
+                    broadcast("エンコード中...", overall, false, false);
+                }
+                mainHandler.postDelayed(this, 1000);
+            }
+        };
+        mainHandler.post(progressRunnable);
+    }
+
+    private void stopProgressPolling() {
+        if (progressRunnable != null) {
+            mainHandler.removeCallbacks(progressRunnable);
+            progressRunnable = null;
+        }
+    }
+
+    private void runFfmpegEncode(File inputFile, File outputFile, Preset preset, EncodeMode mode, int bitrateKbps, String displayName) {
+        String[] args = buildFfmpegArguments(inputFile, outputFile, preset, mode, bitrateKbps);
+        try {
+            FFmpegKit.executeWithArgumentsAsync(args, session -> {
+                if (cancelRequested) {
+                    finishCanceled();
+                    return;
+                }
+                if (ReturnCode.isSuccess(session.getReturnCode()) && outputFile.exists() && outputFile.length() > 0) {
+                    handleItemSuccess(displayName, inputFile, outputFile, preset, mode, bitrateKbps);
+                } else {
+                    String message = "FFmpeg互換ルートの変換に失敗しました。";
+                    if (!TextUtils.isEmpty(session.getFailStackTrace())) message += " " + session.getFailStackTrace();
+                    handleItemError(displayName, new RuntimeException(message), preset, mode, bitrateKbps);
+                }
+            });
+        } catch (Throwable e) {
+            handleItemError(displayName, e, preset, mode, bitrateKbps);
+        }
+    }
+
+    private void handleItemSuccess(String displayName, File inputFile, File outputFile, Preset preset, EncodeMode mode, int bitrateKbps) {
+        stopProgressPolling();
+        saveToMediaStore(outputFile);
+        long outputBytes = outputFile.exists() ? outputFile.length() : 0L;
+        long elapsed = Math.max(1L, System.currentTimeMillis() - activeStartMs);
+        double reduction = activeOriginalBytes > 0 ? (1.0 - ((double) outputBytes / (double) activeOriginalBytes)) * 100.0 : 0.0;
+        String result = "完了: " + displayName + " / 元 " + formatBytes(activeOriginalBytes) + " → 変換後 " + formatBytes(outputBytes) + " / 削減率 " + String.format(Locale.US, "%.1f", reduction) + "% / " + (elapsed / 1000) + "秒";
+        saveHistory(result);
+        broadcast(result, currentOverallProgress(100), false, true);
+        deleteQuietly(inputFile);
+        currentIndex++;
+        processNext(preset, mode, bitrateKbps);
+    }
+
+    private void handleItemError(String displayName, Throwable e, Preset preset, EncodeMode mode, int bitrateKbps) {
+        stopProgressPolling();
+        String logPath = writeErrorLog(displayName, e);
+        String message = "失敗: " + displayName + " / エラーログ保存: " + logPath;
+        saveHistory(message);
+        broadcast(message, currentOverallProgress(100), false, false);
+        deleteQuietly(activeInputFile);
+        currentIndex++;
+        processNext(preset, mode, bitrateKbps);
+    }
+
+    private void cancelCurrent() {
+        cancelRequested = true;
+        broadcast("キャンセル処理中...", currentOverallProgress(0), false, false);
+        stopProgressPolling();
+        try { if (transformer != null) transformer.cancel(); } catch (Throwable ignored) {}
+        try { FFmpegKit.cancel(); } catch (Throwable ignored) {}
+        finishCanceled();
+    }
+
+    private void finishCanceled() {
+        if (!running && cancelRequested) return;
+        running = false;
+        cancelRequested = true;
+        deleteQuietly(activeInputFile);
+        saveHistory("キャンセル: " + nowText());
+        broadcast("キャンセルしました。", currentOverallProgress(0), true, false);
+        updateNotification("キャンセルしました", currentOverallProgress(0), true);
+        stopForeground(false);
+        stopSelf();
+    }
+
+    private void finishAllSuccess() {
+        running = false;
+        broadcast("一括変換が完了しました。", 100, true, true);
+        updateNotification("一括変換完了", 100, true);
+        stopForeground(false);
+        stopSelf();
+    }
+
+    private int currentOverallProgress(int itemProgress) {
+        if (totalCount <= 0) return 0;
+        return Math.max(0, Math.min(100, (int) (((currentIndex * 100.0) + itemProgress) / totalCount)));
     }
 
     private int effectiveHeight(Preset preset, EncodeMode mode) {
@@ -197,15 +365,11 @@ public class EncodeForegroundService extends Service {
                 if (!info.isEncoder()) continue;
                 boolean supportsHevc = false;
                 for (String type : info.getSupportedTypes()) {
-                    if (MediaFormat.MIMETYPE_VIDEO_HEVC.equalsIgnoreCase(type)) {
-                        supportsHevc = true;
-                        break;
-                    }
+                    if (MediaFormat.MIMETYPE_VIDEO_HEVC.equalsIgnoreCase(type)) supportsHevc = true;
                 }
                 if (!supportsHevc) continue;
                 String name = info.getName();
-                boolean hardware = isLikelyHardware(info, name);
-                if (hardware) return name + " / hardware";
+                if (isLikelyHardware(info, name)) return name + " / hardware";
                 fallback = name + " / software候補";
             }
             return fallback;
@@ -222,127 +386,8 @@ public class EncodeForegroundService extends Service {
         return !(lower.startsWith("omx.google") || lower.startsWith("c2.android") || lower.contains("software"));
     }
 
-    private void startProgressPolling() {
-        stopProgressPolling();
-        progressRunnable = new Runnable() {
-            @Override public void run() {
-                if (!running || transformer == null) return;
-                try {
-                    ProgressHolder holder = new ProgressHolder();
-                    int state = transformer.getProgress(holder);
-                    int progress = holder.progress;
-                    if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                        progress = Math.max(5, Math.min(99, progress));
-                        broadcast("エンコード中: " + progress + "%", progress, false, false);
-                        updateNotification("エンコード中 " + progress + "%", progress, false);
-                    } else {
-                        broadcast("エンコード中...", 10, false, false);
-                        updateNotification("エンコード中", 10, false);
-                    }
-                } catch (Throwable ignored) {
-                    broadcast("エンコード中...", 10, false, false);
-                }
-                mainHandler.postDelayed(this, 1000);
-            }
-        };
-        mainHandler.post(progressRunnable);
-    }
-
-    private void stopProgressPolling() {
-        if (progressRunnable != null) {
-            mainHandler.removeCallbacks(progressRunnable);
-            progressRunnable = null;
-        }
-    }
-
-    private void runFfmpegEncode(File inputFile, File outputFile, Preset preset, EncodeMode mode) {
-        String[] args = buildFfmpegArguments(inputFile, outputFile, preset, mode);
-        try {
-            FFmpegKit.executeWithArgumentsAsync(args, session -> {
-                if (ReturnCode.isSuccess(session.getReturnCode()) && outputFile.exists() && outputFile.length() > 0) {
-                    finishWithSuccess(inputFile, outputFile, "FFmpeg互換ルート変換成功 / " + mode.label);
-                } else {
-                    String message = "FFmpeg互換ルートの変換に失敗しました。";
-                    if (!TextUtils.isEmpty(session.getFailStackTrace())) message += " " + session.getFailStackTrace();
-                    finishWithError(message, null);
-                }
-            });
-        } catch (Throwable e) {
-            finishWithError("FFmpegKitを開始できませんでした: " + safeMessage(e), e);
-        }
-    }
-
-    private void finishWithSuccess(File inputFile, File outputFile, String label) {
-        stopProgressPolling();
-        saveToMediaStore(outputFile);
-        deleteQuietly(inputFile);
-        running = false;
-        broadcast(label + " / 保存完了: Movies / NK Encoder", 100, true, true);
-        updateNotification("エンコード完了", 100, true);
-        stopForeground(false);
-        stopSelf();
-    }
-
-    private void finishWithError(String message, Throwable throwable) {
-        stopProgressPolling();
-        deleteQuietly(activeInputFile);
-        running = false;
-        String finalMessage = message;
-        if (throwable != null) finalMessage += " / " + throwable.getClass().getSimpleName();
-        broadcast(finalMessage, 0, true, false);
-        updateNotification("エンコード失敗", 0, true);
-        stopForeground(false);
-        stopSelf();
-    }
-
-    private Notification buildNotification(String text, int progress, boolean done) {
-        Intent openIntent = new Intent(this, MainActivity.class);
-        PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, openIntent, Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
-        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
-        builder.setContentTitle("NK H.265 Encoder")
-                .setContentText(text)
-                .setSmallIcon(android.R.drawable.stat_sys_upload)
-                .setContentIntent(pendingIntent)
-                .setOngoing(!done)
-                .setOnlyAlertOnce(true);
-        if (done) builder.setProgress(0, 0, false);
-        else builder.setProgress(100, Math.max(0, Math.min(100, progress)), false);
-        return builder.build();
-    }
-
-    private void updateNotification(String text, int progress, boolean done) {
-        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-        if (manager != null) manager.notify(NOTIFICATION_ID, buildNotification(text, progress, done));
-    }
-
-    private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "NK H.265 Encoder", NotificationManager.IMPORTANCE_LOW);
-            channel.setDescription("エンコード進行状況");
-            NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-            if (manager != null) manager.createNotificationChannel(channel);
-        }
-    }
-
-    private void broadcast(String message, int progress, boolean done, boolean success) {
-        Intent intent = new Intent(ACTION_STATUS);
-        intent.setPackage(getPackageName());
-        intent.putExtra(EXTRA_MESSAGE, message);
-        intent.putExtra(EXTRA_PROGRESS, Math.max(0, Math.min(100, progress)));
-        intent.putExtra(EXTRA_DONE, done);
-        intent.putExtra(EXTRA_SUCCESS, success);
-        sendBroadcast(intent);
-    }
-
-    private Preset parsePreset(String name) {
-        try { return Preset.valueOf(name); } catch (Exception ignored) { return Preset.LOW; }
-    }
-
-    private EncodeMode parseMode(String name) {
-        try { return EncodeMode.valueOf(name); } catch (Exception ignored) { return EncodeMode.FAST; }
-    }
-
-    private String[] buildFfmpegArguments(File inputFile, File outputFile, Preset preset, EncodeMode mode) {
+    private String[] buildFfmpegArguments(File inputFile, File outputFile, Preset preset, EncodeMode mode, int bitrateKbps) {
+        ArrayList<String> args = new ArrayList<>();
         String scaleFilter = "scale=w='min(" + preset.width + ",iw)':h='min(" + effectiveHeight(preset, mode) + ",ih)':force_original_aspect_ratio=decrease:force_divisible_by=2,format=yuv420p";
         int cores = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
         int threads = mode == EncodeMode.QUALITY ? Math.min(4, cores) : Math.min(8, cores);
@@ -350,21 +395,11 @@ public class EncodeForegroundService extends Service {
         String speedPreset = preset.speedPreset;
         if (mode == EncodeMode.FAST) { crf += 2; speedPreset = "ultrafast"; }
         if (mode == EncodeMode.QUALITY) { crf -= 2; speedPreset = "slow"; }
-        return new String[]{
-                "-y", "-nostdin", "-hide_banner",
-                "-i", inputFile.getAbsolutePath(),
-                "-map", "0:v:0", "-map", "0:a?", "-dn", "-sn",
-                "-vf", scaleFilter,
-                "-c:v", "libx265", "-tag:v", "hvc1",
-                "-preset", speedPreset,
-                "-crf", String.valueOf(crf),
-                "-threads", String.valueOf(threads),
-                "-x265-params", "log-level=error:pools=" + threads + ":frame-threads=1",
-                "-c:a", "aac", "-b:a", preset.audioBitrate, "-ac", "2",
-                "-map_metadata", "-1", "-max_muxing_queue_size", "9999",
-                "-movflags", "+faststart",
-                outputFile.getAbsolutePath()
-        };
+        Collections.addAll(args, "-y", "-nostdin", "-hide_banner", "-i", inputFile.getAbsolutePath(), "-map", "0:v:0", "-map", "0:a?", "-dn", "-sn", "-vf", scaleFilter, "-c:v", "libx265", "-tag:v", "hvc1", "-preset", speedPreset);
+        if (bitrateKbps > 0) Collections.addAll(args, "-b:v", bitrateKbps + "k", "-maxrate", bitrateKbps + "k", "-bufsize", (bitrateKbps * 2) + "k");
+        else Collections.addAll(args, "-crf", String.valueOf(crf));
+        Collections.addAll(args, "-threads", String.valueOf(threads), "-x265-params", "log-level=error:pools=" + threads + ":frame-threads=1", "-c:a", "aac", "-b:a", preset.audioBitrate, "-ac", "2", "-map_metadata", "-1", "-max_muxing_queue_size", "9999", "-movflags", "+faststart", outputFile.getAbsolutePath());
+        return args.toArray(new String[0]);
     }
 
     private File copyUriToCache(Uri uri, String displayName) throws IOException {
@@ -379,13 +414,14 @@ public class EncodeForegroundService extends Service {
         return inputFile;
     }
 
-    private File createOutputFile(Preset preset, EncodeMode mode) throws IOException {
+    private File createOutputFile(Preset preset, EncodeMode mode, int bitrateKbps) throws IOException {
         File dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
         if (dir == null) dir = getFilesDir();
         File encoderDir = new File(dir, "NK_Encoder");
         if (!encoderDir.exists() && !encoderDir.mkdirs()) throw new IOException("出力フォルダを作成できませんでした。");
         String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        return new File(encoderDir, "encoded_" + preset.name().toLowerCase(Locale.US) + "_" + mode.name().toLowerCase(Locale.US) + "_" + timestamp + ".mp4");
+        String br = bitrateKbps > 0 ? bitrateKbps + "k" : "auto";
+        return new File(encoderDir, "encoded_" + preset.name().toLowerCase(Locale.US) + "_" + mode.name().toLowerCase(Locale.US) + "_" + br + "_" + timestamp + ".mp4");
     }
 
     private Uri saveToMediaStore(File file) {
@@ -415,6 +451,68 @@ public class EncodeForegroundService extends Service {
         }
     }
 
+    private String writeErrorLog(String displayName, Throwable e) {
+        try {
+            File dir = new File(getExternalFilesDir(null), "error_logs");
+            if (!dir.exists()) dir.mkdirs();
+            File log = new File(dir, "error_" + System.currentTimeMillis() + ".txt");
+            StringWriter sw = new StringWriter();
+            if (e != null) e.printStackTrace(new PrintWriter(sw));
+            try (FileOutputStream out = new FileOutputStream(log)) {
+                String text = "file=" + displayName + "\ntime=" + nowText() + "\n" + sw;
+                out.write(text.getBytes());
+            }
+            return log.getAbsolutePath();
+        } catch (Exception ex) {
+            return "保存失敗: " + safeMessage(ex);
+        }
+    }
+
+    private void saveHistory(String line) {
+        SharedPreferences prefs = getSharedPreferences("nk_encoder", MODE_PRIVATE);
+        String old = prefs.getString("history", "");
+        String next = nowText() + "\n" + line + "\n\n" + old;
+        if (next.length() > 6000) next = next.substring(0, 6000);
+        prefs.edit().putString("history", next).apply();
+    }
+
+    private Notification buildNotification(String text, int progress, boolean done) {
+        Intent openIntent = new Intent(this, MainActivity.class);
+        PendingIntent pendingIntent = PendingIntent.getActivity(this, 0, openIntent, Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE : 0);
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
+        builder.setContentTitle("NK H.265 Encoder").setContentText(text).setSmallIcon(android.R.drawable.stat_sys_upload).setContentIntent(pendingIntent).setOngoing(!done).setOnlyAlertOnce(true);
+        if (done) builder.setProgress(0, 0, false);
+        else builder.setProgress(100, Math.max(0, Math.min(100, progress)), false);
+        return builder.build();
+    }
+
+    private void updateNotification(String text, int progress, boolean done) {
+        NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (manager != null) manager.notify(NOTIFICATION_ID, buildNotification(text, progress, done));
+    }
+
+    private void createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "NK H.265 Encoder", NotificationManager.IMPORTANCE_LOW);
+            channel.setDescription("エンコード進行状況");
+            NotificationManager manager = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+            if (manager != null) manager.createNotificationChannel(channel);
+        }
+    }
+
+    private void broadcast(String message, int progress, boolean done, boolean success) {
+        Intent intent = new Intent(ACTION_STATUS);
+        intent.setPackage(getPackageName());
+        intent.putExtra(EXTRA_MESSAGE, message);
+        intent.putExtra(EXTRA_PROGRESS, Math.max(0, Math.min(100, progress)));
+        intent.putExtra(EXTRA_DONE, done);
+        intent.putExtra(EXTRA_SUCCESS, success);
+        sendBroadcast(intent);
+    }
+
+    private Preset parsePreset(String name) { try { return Preset.valueOf(name); } catch (Exception ignored) { return Preset.LOW; } }
+    private EncodeMode parseMode(String name) { try { return EncodeMode.valueOf(name); } catch (Exception ignored) { return EncodeMode.FAST; } }
+
     private String getSafeExtension(String displayName) {
         if (displayName == null) return ".mp4";
         String lower = displayName.toLowerCase(Locale.US);
@@ -432,6 +530,8 @@ public class EncodeForegroundService extends Service {
         return lower.endsWith(".mp4") || lower.endsWith(".m4v") || lower.endsWith(".mov");
     }
 
+    private String bitrateLabel(int kbps) { return kbps > 0 ? kbps + " kbps" : "自動"; }
+
     private String formatBytes(long bytes) {
         if (bytes < 1024) return bytes + " B";
         double kb = bytes / 1024.0;
@@ -441,16 +541,8 @@ public class EncodeForegroundService extends Service {
         return String.format(Locale.US, "%.2f GB", mb / 1024.0);
     }
 
-    private String safeMessage(Throwable throwable) {
-        if (throwable == null) return "unknown";
-        String message = throwable.getMessage();
-        return TextUtils.isEmpty(message) ? throwable.getClass().getSimpleName() : message;
-    }
-
-    private void deleteQuietly(File file) {
-        if (file != null && file.exists()) {
-            //noinspection ResultOfMethodCallIgnored
-            file.delete();
-        }
-    }
+    private String nowText() { return new SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.US).format(new Date()); }
+    private String safeMessage(Throwable throwable) { if (throwable == null) return "unknown"; String message = throwable.getMessage(); return TextUtils.isEmpty(message) ? throwable.getClass().getSimpleName() : message; }
+    private void deleteQuietly(File file) { if (file != null && file.exists()) { //noinspection ResultOfMethodCallIgnored
+            file.delete(); } }
 }
