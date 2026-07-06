@@ -1,17 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-
     <application
         android:allowBackup="true"
-        android:extractNativeLibs="true"
-        android:label="@string/app_name"
+        android:label="NKスコア管理"
         android:largeHeap="true"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
-            android:name=".MainActivity"
+            android:name="jp.co.nkts.scoremanager.MainActivity"
             android:exported="true"
             android:resizeableActivity="true">
             <intent-filter>
@@ -19,9 +14,5 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <service
-            android:name=".EncodeForegroundService"
-            android:exported="false"
-            android:foregroundServiceType="mediaProcessing" />
     </application>
 </manifest>
