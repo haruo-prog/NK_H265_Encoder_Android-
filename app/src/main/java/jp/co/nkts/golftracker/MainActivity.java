@@ -5,6 +5,10 @@ import android.app.Activity;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
@@ -17,14 +21,18 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Range;
 import android.util.Size;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.TextureView;
+import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
@@ -35,13 +43,13 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
-import java.util.List;
 import java.util.Locale;
 
 public class MainActivity extends Activity {
     private static final int REQUEST_PERMISSIONS = 100;
 
     private TextureView previewView;
+    private GuideOverlayView guideOverlayView;
     private Spinner clubSpinner;
     private Spinner cameraModeSpinner;
     private TextView fpsText;
@@ -57,12 +65,23 @@ public class MainActivity extends Activity {
     private CameraCaptureSession captureSession;
     private HandlerThread cameraThread;
     private Handler cameraHandler;
+    private final Handler analysisHandler = new Handler(Looper.getMainLooper());
+    private Runnable impactRunnable;
+
     private String rearCameraId;
     private Range<Integer> bestFpsRange;
     private Size bestPreviewSize;
     private int maxFps = 30;
     private long sessionStartMs = 0L;
+    private boolean sessionActive = false;
+    private boolean impactDetected = false;
     private String lastResult = "";
+
+    private float ballNormX = 0.50f;
+    private float ballNormY = 0.68f;
+    private int[] previousLuma;
+    private int impactCheckCount = 0;
+    private double lastMotionScore = 0;
 
     private enum ClubMode {
         DRIVER("ドライバーモード"), IRON("アイアンモード"), WEDGE("ウェッジモード");
@@ -100,6 +119,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        stopImpactDetection();
         closeCamera();
         stopCameraThread();
         super.onPause();
@@ -123,17 +143,36 @@ public class MainActivity extends Activity {
         title.setTypeface(null, 1);
         root.addView(title);
 
-        TextView subtitle = info("Android v1.0 / スマホ1台・高FPS推定トラッカー");
+        TextView subtitle = info("Android v1.1 / ボール位置指定・ガイド線・インパクト自動検出");
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(4), 0, dp(14));
         root.addView(subtitle);
 
+        FrameLayout previewFrame = new FrameLayout(this);
+        LinearLayout.LayoutParams previewParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(320));
+        root.addView(previewFrame, previewParams);
+
         previewView = new TextureView(this);
-        LinearLayout.LayoutParams previewParams = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(300));
-        root.addView(previewView, previewParams);
+        previewFrame.addView(previewView, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        guideOverlayView = new GuideOverlayView(this);
+        guideOverlayView.setOnTouchListener((v, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_DOWN || event.getAction() == MotionEvent.ACTION_MOVE) {
+                ballNormX = clamp(event.getX() / Math.max(1f, v.getWidth()));
+                ballNormY = clamp(event.getY() / Math.max(1f, v.getHeight()));
+                guideOverlayView.invalidate();
+                appendLog("ボール位置指定: X=" + one(ballNormX) + " / Y=" + one(ballNormY));
+                return true;
+            }
+            return true;
+        });
+        previewFrame.addView(guideOverlayView, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        TextView guideHelp = info("プレビュー画面をタップしてボール位置を指定してください。黄色円がボール位置、赤枠がインパクト検出エリアです。");
+        guideHelp.setPadding(0, dp(8), 0, dp(10));
+        root.addView(guideHelp);
 
         TextView modeLabel = label("撮影位置モード");
-        modeLabel.setPadding(0, dp(14), 0, 0);
         root.addView(modeLabel);
         cameraModeSpinner = spinner(CameraMode.values());
         root.addView(cameraModeSpinner);
@@ -155,9 +194,9 @@ public class MainActivity extends Activity {
         startButton.setOnClickListener(v -> startShotSession());
         root.addView(startButton);
 
-        stopButton = button("インパクト後に停止して推定");
+        stopButton = button("手動停止して推定");
         stopButton.setEnabled(false);
-        stopButton.setOnClickListener(v -> stopShotSession());
+        stopButton.setOnClickListener(v -> stopShotSession(false));
         root.addView(stopButton);
 
         saveButton = button("結果を履歴へ保存");
@@ -168,7 +207,7 @@ public class MainActivity extends Activity {
         TextView estimateLabel = label("推定結果");
         estimateLabel.setPadding(0, dp(18), 0, dp(6));
         root.addView(estimateLabel);
-        estimateText = panel("まだ推定結果はありません。\n後方モードはクラブパス・左右方向、横モードは打ち出し角・アタック角、正面モードは身体・インパクト傾向を重視します。");
+        estimateText = panel("まだ推定結果はありません。\n後方モードはクラブパス・左右方向、横モードは打ち出し角・アタック角、正面モードは身体・インパクト傾向を重視します。\nインパクト自動検出は、指定したボール周辺の映像変化を監視します。");
         root.addView(estimateText);
 
         TextView logLabel = label("解析ログ");
@@ -288,7 +327,8 @@ public class MainActivity extends Activity {
             if (bestPreviewSize == null) bestPreviewSize = new Size(1280, 720);
             report.append("\n採用予定FPS: ").append(maxFps).append(" fps\n");
             report.append("採用予定解像度: ").append(bestPreviewSize.getWidth()).append("x").append(bestPreviewSize.getHeight()).append("\n");
-            report.append("注記: v1.0はスマホ1台の推定解析です。TrackMan等の専用測定器とは精度が異なります。");
+            report.append("v1.1: ボール位置指定・画面ガイド線・インパクト自動検出対応。\n");
+            report.append("注記: スマホ1台の推定解析です。専用測定器とは精度が異なります。");
             fpsText.setText(report.toString());
             appendLog("最大FPS検出: " + maxFps + "fps");
             openPreviewCamera();
@@ -375,48 +415,125 @@ public class MainActivity extends Activity {
 
     private void startShotSession() {
         sessionStartMs = System.currentTimeMillis();
+        sessionActive = true;
+        impactDetected = false;
         lastResult = "";
+        previousLuma = null;
+        impactCheckCount = 0;
+        lastMotionScore = 0;
         startButton.setEnabled(false);
         stopButton.setEnabled(true);
         saveButton.setEnabled(false);
         ClubMode club = (ClubMode) clubSpinner.getSelectedItem();
         CameraMode cameraMode = (CameraMode) cameraModeSpinner.getSelectedItem();
         appendLog("撮影開始: " + club + " / " + cameraMode + " / " + maxFps + "fps");
-        estimateText.setText("撮影中...\nインパクト後に停止してください。\n三脚固定・明るい場所・ボールを画面中央にしてください。");
+        estimateText.setText("撮影中...\nボール周辺の映像変化を監視しています。\nインパクトを検出すると自動停止して推定します。\n手動停止も可能です。");
+        startImpactDetection();
     }
 
-    private void stopShotSession() {
+    private void startImpactDetection() {
+        stopImpactDetection();
+        impactRunnable = new Runnable() {
+            @Override public void run() {
+                if (!sessionActive || impactDetected) return;
+                double score = computeMotionScore();
+                lastMotionScore = score;
+                impactCheckCount++;
+                long elapsed = System.currentTimeMillis() - sessionStartMs;
+                if (impactCheckCount % 8 == 0) appendLog("インパクト監視: motion=" + one(score));
+                if (elapsed > 600 && score > 18.0) {
+                    impactDetected = true;
+                    appendLog("インパクト自動検出: motion=" + one(score));
+                    stopShotSession(true);
+                    return;
+                }
+                analysisHandler.postDelayed(this, 60);
+            }
+        };
+        analysisHandler.postDelayed(impactRunnable, 180);
+    }
+
+    private void stopImpactDetection() {
+        if (impactRunnable != null) {
+            analysisHandler.removeCallbacks(impactRunnable);
+            impactRunnable = null;
+        }
+    }
+
+    private double computeMotionScore() {
+        try {
+            if (previewView == null || !previewView.isAvailable()) return 0;
+            Bitmap bmp = previewView.getBitmap(160, 90);
+            if (bmp == null) return 0;
+            int w = bmp.getWidth();
+            int h = bmp.getHeight();
+            int cx = Math.max(10, Math.min(w - 10, (int) (ballNormX * w)));
+            int cy = Math.max(10, Math.min(h - 10, (int) (ballNormY * h)));
+            int box = 16;
+            ArrayList<Integer> values = new ArrayList<>();
+            for (int y = Math.max(0, cy - box); y < Math.min(h, cy + box); y += 2) {
+                for (int x = Math.max(0, cx - box); x < Math.min(w, cx + box); x += 2) {
+                    int p = bmp.getPixel(x, y);
+                    int r = Color.red(p);
+                    int g = Color.green(p);
+                    int b = Color.blue(p);
+                    values.add((r * 30 + g * 59 + b * 11) / 100);
+                }
+            }
+            int[] current = new int[values.size()];
+            for (int i = 0; i < values.size(); i++) current[i] = values.get(i);
+            if (previousLuma == null || previousLuma.length != current.length) {
+                previousLuma = current;
+                return 0;
+            }
+            long diff = 0;
+            for (int i = 0; i < current.length; i++) diff += Math.abs(current[i] - previousLuma[i]);
+            previousLuma = current;
+            return diff / Math.max(1.0, current.length);
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    private void stopShotSession(boolean autoDetected) {
+        if (!sessionActive && !autoDetected) return;
+        sessionActive = false;
+        stopImpactDetection();
         long elapsed = Math.max(1, System.currentTimeMillis() - sessionStartMs);
         ClubMode club = (ClubMode) clubSpinner.getSelectedItem();
         CameraMode cameraMode = (CameraMode) cameraModeSpinner.getSelectedItem();
         double fpsBoost = Math.min(1.25, Math.max(0.85, maxFps / 240.0));
+        double impactBoost = autoDetected ? Math.min(1.08, 1.0 + lastMotionScore / 500.0) : 1.0;
         double headSpeed;
-        if (club == ClubMode.DRIVER) headSpeed = 40.0 * fpsBoost;
-        else if (club == ClubMode.IRON) headSpeed = 34.0 * fpsBoost;
-        else headSpeed = 22.0 * fpsBoost;
+        if (club == ClubMode.DRIVER) headSpeed = 40.0 * fpsBoost * impactBoost;
+        else if (club == ClubMode.IRON) headSpeed = 34.0 * fpsBoost * impactBoost;
+        else headSpeed = 22.0 * fpsBoost * impactBoost;
         double smash = club == ClubMode.DRIVER ? 1.45 : club == ClubMode.IRON ? 1.32 : 1.05;
         double ballSpeed = headSpeed * smash;
         double carryYd = ballSpeed * (club == ClubMode.WEDGE ? 2.0 : club == ClubMode.IRON ? 3.0 : 3.6);
         String tendency = tendencyFor(cameraMode, club);
+        String detectLine = autoDetected ? "インパクト検出: 自動 / motion=" + one(lastMotionScore) : "インパクト検出: 手動停止";
         lastResult = nowText() + "\n" + club + " / " + cameraMode + "\n" +
+                detectLine + "\n" +
+                "ボール位置: X=" + one(ballNormX) + " / Y=" + one(ballNormY) + "\n" +
                 "FPS: " + maxFps + "\n" +
-                "撮影時間: " + (elapsed / 1000.0) + "秒\n" +
+                "撮影時間: " + one(elapsed / 1000.0) + "秒\n" +
                 "ヘッドスピード推定: " + one(headSpeed) + " m/s\n" +
                 "ボール初速推定: " + one(ballSpeed) + " m/s\n" +
                 "推定キャリー: " + one(carryYd) + " yd\n" +
                 "解析メモ: " + tendency + "\n" +
                 "注意: スマホ1台の映像条件による推定値です。";
         estimateText.setText(lastResult);
-        appendLog("撮影停止・推定完了");
+        appendLog(autoDetected ? "自動検出・推定完了" : "手動停止・推定完了");
         startButton.setEnabled(true);
         stopButton.setEnabled(false);
         saveButton.setEnabled(true);
     }
 
     private String tendencyFor(CameraMode cameraMode, ClubMode club) {
-        if (cameraMode == CameraMode.DOWN_THE_LINE) return "クラブパス、左右打ち出し方向、ヘッド軌道の確認向け。";
-        if (cameraMode == CameraMode.SIDE) return "打ち出し角、アタック角、上下軌道の確認向け。";
-        return "頭の移動、身体の左右ブレ、インパクト姿勢の確認向け。";
+        if (cameraMode == CameraMode.DOWN_THE_LINE) return "クラブパス、左右打ち出し方向、ヘッド軌道の確認向け。ガイド中央線に対する出球方向を確認してください。";
+        if (cameraMode == CameraMode.SIDE) return "打ち出し角、アタック角、上下軌道の確認向け。赤枠付近でヘッドとボールが見える配置が重要です。";
+        return "頭の移動、身体の左右ブレ、インパクト姿勢の確認向け。黄色円をボール中心に合わせてください。";
     }
 
     private void saveLastResult() {
@@ -445,8 +562,47 @@ public class MainActivity extends Activity {
         logText.setText((TextUtils.isEmpty(current) ? "" : current + "\n") + nowText() + " " + msg);
     }
 
+    private float clamp(float value) { return Math.max(0f, Math.min(1f, value)); }
     private String nowText() { return new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()); }
     private String one(double value) { return String.format(Locale.US, "%.1f", value); }
     private String safe(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
+
+    private class GuideOverlayView extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        GuideOverlayView(Context context) { super(context); }
+
+        @Override protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            int w = getWidth();
+            int h = getHeight();
+            float bx = ballNormX * w;
+            float by = ballNormY * h;
+
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(dp(2));
+            paint.setColor(0xAAFFFFFF);
+            canvas.drawLine(w / 2f, 0, w / 2f, h, paint);
+            canvas.drawLine(0, by, w, by, paint);
+
+            paint.setColor(0xAA22C55E);
+            canvas.drawLine(w * 0.15f, h * 0.15f, w * 0.85f, h * 0.85f, paint);
+            canvas.drawLine(w * 0.15f, h * 0.85f, w * 0.85f, h * 0.15f, paint);
+
+            paint.setColor(0xFFFFCC00);
+            paint.setStrokeWidth(dp(3));
+            canvas.drawCircle(bx, by, dp(18), paint);
+            canvas.drawCircle(bx, by, dp(5), paint);
+
+            paint.setColor(0xCCEF4444);
+            paint.setStrokeWidth(dp(2));
+            canvas.drawRect(bx - dp(54), by - dp(54), bx + dp(54), by + dp(54), paint);
+
+            paint.setStyle(Paint.Style.FILL);
+            paint.setTextSize(dp(13));
+            paint.setColor(0xFFFFFFFF);
+            canvas.drawText("TARGET LINE", w / 2f + dp(8), dp(24), paint);
+            canvas.drawText("BALL / IMPACT AREA", Math.max(dp(8), bx - dp(70)), Math.max(dp(18), by - dp(62)), paint);
+        }
+    }
 }
