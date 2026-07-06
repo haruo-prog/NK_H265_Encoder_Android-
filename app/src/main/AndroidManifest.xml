@@ -1,17 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="true" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
         android:allowBackup="true"
-        android:extractNativeLibs="true"
-        android:label="@string/app_name"
+        android:label="NK Golf Tracker"
         android:largeHeap="true"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
-            android:name=".MainActivity"
+            android:name="jp.co.nkts.golftracker.MainActivity"
             android:exported="true"
             android:resizeableActivity="true">
             <intent-filter>
@@ -19,9 +21,5 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <service
-            android:name=".EncodeForegroundService"
-            android:exported="false"
-            android:foregroundServiceType="mediaProcessing" />
     </application>
 </manifest>
