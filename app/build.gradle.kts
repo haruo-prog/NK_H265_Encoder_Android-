@@ -10,8 +10,8 @@ android {
         applicationId = "jp.co.nkts.scoremanager"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0-beta"
+        versionCode = 2
+        versionName = "1.1-beta"
     }
 
     compileOptions {
