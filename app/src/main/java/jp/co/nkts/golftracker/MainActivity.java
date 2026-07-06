@@ -84,7 +84,10 @@ public class MainActivity extends Activity {
     private double lastMotionScore = 0;
 
     private enum ClubMode {
-        DRIVER("ドライバーモード"), IRON("アイアンモード"), WEDGE("ウェッジモード");
+        W1("1W"), W3("3W"), W5("5W"),
+        UT2("2UT"), UT3("3UT"), UT4("4UT"), UT5("5UT"),
+        I3("3I"), I4("4I"), I5("5I"), I6("6I"), I7("7I"), I8("8I"), I9("9I"),
+        PW("PW"), AW("AW"), SW("SW"), LW("LW");
         final String label;
         ClubMode(String label) { this.label = label; }
         @Override public String toString() { return label; }
@@ -143,7 +146,7 @@ public class MainActivity extends Activity {
         title.setTypeface(null, 1);
         root.addView(title);
 
-        TextView subtitle = info("Android v1.1 / ボール位置指定・ガイド線・インパクト自動検出");
+        TextView subtitle = info("Android v1.2 / クラブ詳細選択・日付順ログ保存");
         subtitle.setGravity(Gravity.CENTER_HORIZONTAL);
         subtitle.setPadding(0, dp(4), 0, dp(14));
         root.addView(subtitle);
@@ -177,10 +180,11 @@ public class MainActivity extends Activity {
         cameraModeSpinner = spinner(CameraMode.values());
         root.addView(cameraModeSpinner);
 
-        TextView clubLabel = label("クラブモード");
+        TextView clubLabel = label("クラブ選択");
         clubLabel.setPadding(0, dp(12), 0, 0);
         root.addView(clubLabel);
         clubSpinner = spinner(ClubMode.values());
+        clubSpinner.setSelection(ClubMode.I7.ordinal());
         root.addView(clubSpinner);
 
         scanButton = button("リアカメラ最大FPSを再検出");
@@ -207,7 +211,7 @@ public class MainActivity extends Activity {
         TextView estimateLabel = label("推定結果");
         estimateLabel.setPadding(0, dp(18), 0, dp(6));
         root.addView(estimateLabel);
-        estimateText = panel("まだ推定結果はありません。\n後方モードはクラブパス・左右方向、横モードは打ち出し角・アタック角、正面モードは身体・インパクト傾向を重視します。\nインパクト自動検出は、指定したボール周辺の映像変化を監視します。");
+        estimateText = panel("まだ推定結果はありません。\nクラブは 1W / 3W / 5W / 2UT / 3UT / 4UT / 5UT / 3I〜9I / PW / AW / SW / LW から選択できます。\n履歴は保存日時の新しい順に表示されます。");
         root.addView(estimateText);
 
         TextView logLabel = label("解析ログ");
@@ -216,7 +220,7 @@ public class MainActivity extends Activity {
         logText = panel("起動しました。");
         root.addView(logText);
 
-        TextView historyLabel = label("ショット履歴");
+        TextView historyLabel = label("ショット履歴 / 日付順・最新順");
         historyLabel.setPadding(0, dp(18), 0, dp(6));
         root.addView(historyLabel);
         historyText = panel("履歴はまだありません。");
@@ -327,7 +331,7 @@ public class MainActivity extends Activity {
             if (bestPreviewSize == null) bestPreviewSize = new Size(1280, 720);
             report.append("\n採用予定FPS: ").append(maxFps).append(" fps\n");
             report.append("採用予定解像度: ").append(bestPreviewSize.getWidth()).append("x").append(bestPreviewSize.getHeight()).append("\n");
-            report.append("v1.1: ボール位置指定・画面ガイド線・インパクト自動検出対応。\n");
+            report.append("v1.2: クラブ詳細選択・日付順ログ保存対応。\n");
             report.append("注記: スマホ1台の推定解析です。専用測定器とは精度が異なります。");
             fpsText.setText(report.toString());
             appendLog("最大FPS検出: " + maxFps + "fps");
@@ -427,7 +431,7 @@ public class MainActivity extends Activity {
         ClubMode club = (ClubMode) clubSpinner.getSelectedItem();
         CameraMode cameraMode = (CameraMode) cameraModeSpinner.getSelectedItem();
         appendLog("撮影開始: " + club + " / " + cameraMode + " / " + maxFps + "fps");
-        estimateText.setText("撮影中...\nボール周辺の映像変化を監視しています。\nインパクトを検出すると自動停止して推定します。\n手動停止も可能です。");
+        estimateText.setText("撮影中...\nクラブ: " + club + "\nボール周辺の映像変化を監視しています。\nインパクトを検出すると自動停止して推定します。\n手動停止も可能です。");
         startImpactDetection();
     }
 
@@ -504,16 +508,14 @@ public class MainActivity extends Activity {
         CameraMode cameraMode = (CameraMode) cameraModeSpinner.getSelectedItem();
         double fpsBoost = Math.min(1.25, Math.max(0.85, maxFps / 240.0));
         double impactBoost = autoDetected ? Math.min(1.08, 1.0 + lastMotionScore / 500.0) : 1.0;
-        double headSpeed;
-        if (club == ClubMode.DRIVER) headSpeed = 40.0 * fpsBoost * impactBoost;
-        else if (club == ClubMode.IRON) headSpeed = 34.0 * fpsBoost * impactBoost;
-        else headSpeed = 22.0 * fpsBoost * impactBoost;
-        double smash = club == ClubMode.DRIVER ? 1.45 : club == ClubMode.IRON ? 1.32 : 1.05;
-        double ballSpeed = headSpeed * smash;
-        double carryYd = ballSpeed * (club == ClubMode.WEDGE ? 2.0 : club == ClubMode.IRON ? 3.0 : 3.6);
+        double headSpeed = baseHeadSpeed(club) * fpsBoost * impactBoost;
+        double ballSpeed = headSpeed * smashFactor(club);
+        double carryYd = ballSpeed * carryFactor(club);
         String tendency = tendencyFor(cameraMode, club);
         String detectLine = autoDetected ? "インパクト検出: 自動 / motion=" + one(lastMotionScore) : "インパクト検出: 手動停止";
-        lastResult = nowText() + "\n" + club + " / " + cameraMode + "\n" +
+        lastResult = fullDateText() + "\n" +
+                "クラブ: " + club + "\n" +
+                "撮影位置: " + cameraMode + "\n" +
                 detectLine + "\n" +
                 "ボール位置: X=" + one(ballNormX) + " / Y=" + one(ballNormY) + "\n" +
                 "FPS: " + maxFps + "\n" +
@@ -521,19 +523,117 @@ public class MainActivity extends Activity {
                 "ヘッドスピード推定: " + one(headSpeed) + " m/s\n" +
                 "ボール初速推定: " + one(ballSpeed) + " m/s\n" +
                 "推定キャリー: " + one(carryYd) + " yd\n" +
+                "クラブ分類: " + clubCategory(club) + "\n" +
                 "解析メモ: " + tendency + "\n" +
                 "注意: スマホ1台の映像条件による推定値です。";
         estimateText.setText(lastResult);
-        appendLog(autoDetected ? "自動検出・推定完了" : "手動停止・推定完了");
+        appendLog(autoDetected ? "自動検出・推定完了: " + club : "手動停止・推定完了: " + club);
         startButton.setEnabled(true);
         stopButton.setEnabled(false);
         saveButton.setEnabled(true);
     }
 
+    private double baseHeadSpeed(ClubMode club) {
+        switch (club) {
+            case W1: return 40.0;
+            case W3: return 38.0;
+            case W5: return 36.5;
+            case UT2: return 36.0;
+            case UT3: return 35.0;
+            case UT4: return 34.0;
+            case UT5: return 33.0;
+            case I3: return 34.0;
+            case I4: return 33.0;
+            case I5: return 32.0;
+            case I6: return 31.0;
+            case I7: return 30.0;
+            case I8: return 29.0;
+            case I9: return 28.0;
+            case PW: return 26.5;
+            case AW: return 25.0;
+            case SW: return 23.5;
+            case LW: return 22.0;
+            default: return 30.0;
+        }
+    }
+
+    private double smashFactor(ClubMode club) {
+        switch (club) {
+            case W1: return 1.45;
+            case W3: return 1.43;
+            case W5: return 1.40;
+            case UT2:
+            case UT3:
+            case UT4:
+            case UT5: return 1.36;
+            case I3:
+            case I4:
+            case I5: return 1.34;
+            case I6:
+            case I7:
+            case I8:
+            case I9: return 1.30;
+            case PW: return 1.22;
+            case AW: return 1.16;
+            case SW: return 1.08;
+            case LW: return 1.02;
+            default: return 1.30;
+        }
+    }
+
+    private double carryFactor(ClubMode club) {
+        switch (club) {
+            case W1: return 3.60;
+            case W3: return 3.45;
+            case W5: return 3.30;
+            case UT2: return 3.25;
+            case UT3: return 3.15;
+            case UT4: return 3.05;
+            case UT5: return 2.95;
+            case I3: return 3.05;
+            case I4: return 2.95;
+            case I5: return 2.85;
+            case I6: return 2.75;
+            case I7: return 2.65;
+            case I8: return 2.50;
+            case I9: return 2.35;
+            case PW: return 2.15;
+            case AW: return 2.00;
+            case SW: return 1.80;
+            case LW: return 1.60;
+            default: return 2.60;
+        }
+    }
+
+    private String clubCategory(ClubMode club) {
+        switch (club) {
+            case W1:
+            case W3:
+            case W5: return "ウッド";
+            case UT2:
+            case UT3:
+            case UT4:
+            case UT5: return "ユーティリティ";
+            case I3:
+            case I4:
+            case I5:
+            case I6:
+            case I7:
+            case I8:
+            case I9: return "アイアン";
+            case PW:
+            case AW:
+            case SW:
+            case LW: return "ウェッジ";
+            default: return "未分類";
+        }
+    }
+
     private String tendencyFor(CameraMode cameraMode, ClubMode club) {
-        if (cameraMode == CameraMode.DOWN_THE_LINE) return "クラブパス、左右打ち出し方向、ヘッド軌道の確認向け。ガイド中央線に対する出球方向を確認してください。";
-        if (cameraMode == CameraMode.SIDE) return "打ち出し角、アタック角、上下軌道の確認向け。赤枠付近でヘッドとボールが見える配置が重要です。";
-        return "頭の移動、身体の左右ブレ、インパクト姿勢の確認向け。黄色円をボール中心に合わせてください。";
+        String base = club + " / " + clubCategory(club) + "。";
+        if (cameraMode == CameraMode.DOWN_THE_LINE) return base + "クラブパス、左右打ち出し方向、ヘッド軌道の確認向け。ガイド中央線に対する出球方向を確認してください。";
+        if (cameraMode == CameraMode.SIDE) return base + "打ち出し角、アタック角、上下軌道の確認向け。赤枠付近でヘッドとボールが見える配置が重要です。";
+        return base + "頭の移動、身体の左右ブレ、インパクト姿勢の確認向け。黄色円をボール中心に合わせてください。";
     }
 
     private void saveLastResult() {
@@ -543,11 +643,11 @@ public class MainActivity extends Activity {
         }
         SharedPreferences prefs = getSharedPreferences("nk_golf_tracker", MODE_PRIVATE);
         String old = prefs.getString("history", "");
-        String next = lastResult + "\n--------------------\n" + old;
-        if (next.length() > 8000) next = next.substring(0, 8000);
+        String next = "保存日時: " + fullDateText() + "\n" + lastResult + "\n--------------------\n" + old;
+        if (next.length() > 12000) next = next.substring(0, 12000);
         prefs.edit().putString("history", next).apply();
         loadHistory();
-        appendLog("履歴保存完了");
+        appendLog("履歴保存完了（日付順・最新順）");
     }
 
     private void loadHistory() {
@@ -564,6 +664,7 @@ public class MainActivity extends Activity {
 
     private float clamp(float value) { return Math.max(0f, Math.min(1f, value)); }
     private String nowText() { return new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()); }
+    private String fullDateText() { return new SimpleDateFormat("yyyy/MM/dd HH:mm:ss", Locale.US).format(new Date()); }
     private String one(double value) { return String.format(Locale.US, "%.1f", value); }
     private String safe(Exception e) { return e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(); }
     private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density + 0.5f); }
